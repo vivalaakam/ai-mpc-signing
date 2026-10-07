@@ -1,0 +1,16 @@
+[package]
+name = "ai-signing-desktop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ai-signing-gui"
+path = "src/main.rs"
+
+[dependencies]
+ai-signing-client = { path = "../client" }
+async-channel = "2"
+gpui-kit = "0.7"
+uuid = { version = "1", features = ["serde"] }
