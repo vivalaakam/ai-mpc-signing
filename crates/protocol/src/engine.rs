@@ -1,12 +1,18 @@
 use std::collections::{BTreeMap, HashMap};
 
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD as B64, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use crypto_box::{aead::OsRng, PublicKey, SecretKey};
 use ed25519_dalek::{Verifier, VerifyingKey};
 use frost_ed25519 as frost;
+use hmac::{Hmac, Mac};
 use rand::rngs::OsRng as RandOsRng;
 use serde::{Deserialize, Serialize};
+use sha2::Sha512;
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::{ClientMsg, Error, GroupDto, SealedPackage, ServerMsg};
 
@@ -40,9 +46,13 @@ impl DeviceKey {
         let bytes: [u8; 32] = bytes
             .try_into()
             .map_err(|_| Error::msg("секрет устройства должен быть 32 байта"))?;
-        Ok(Self {
+        Ok(Self::from_secret_bytes(bytes))
+    }
+
+    pub fn from_secret_bytes(bytes: [u8; 32]) -> Self {
+        Self {
             secret: SecretKey::from_bytes(bytes),
-        })
+        }
     }
 
     pub fn secret_hex(&self) -> String {
@@ -70,6 +80,91 @@ impl DeviceKey {
             .unseal(&bytes)
             .map_err(|_| Error::msg("не удалось расшифровать пакет DKG"))
     }
+}
+
+/// Long-term seed of one user. Group keys are hardened children of `m/30211'/0'/0'`.
+///
+/// The group path is `m/30211'/0'/0'/w0'/w1'/w2'/w3'`, where each `w` is a big-endian
+/// quarter of the group id with the high bit set. SLIP-0010 hardened derivation
+/// (HMAC-SHA512, key `"ed25519 seed"`). The 32-byte child key is the X25519 secret.
+pub struct HdIdentity {
+    seed: [u8; 32],
+}
+
+impl Drop for HdIdentity {
+    fn drop(&mut self) {
+        self.seed.zeroize();
+    }
+}
+
+impl HdIdentity {
+    pub fn generate() -> Self {
+        let mut seed = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut RandOsRng, &mut seed);
+        Self { seed }
+    }
+
+    pub fn from_seed(seed: [u8; 32]) -> Self {
+        Self { seed }
+    }
+
+    pub fn seed(&self) -> [u8; 32] {
+        self.seed
+    }
+
+    /// Public account key registered for the user, path `m/30211'/0'/0'`.
+    pub fn account_key(&self) -> DeviceKey {
+        let (key, _) = account_node(&self.seed);
+        DeviceKey::from_secret_bytes(key)
+    }
+
+    /// Key used only inside one group.
+    pub fn group_key(&self, group_id: Uuid) -> DeviceKey {
+        let (mut key, mut chain) = account_node(&self.seed);
+        for word in group_id.as_bytes().chunks(4) {
+            let mut buf = [0u8; 4];
+            buf.copy_from_slice(word);
+            let index = u32::from_be_bytes(buf) | 0x8000_0000;
+            (key, chain) = slip_child(key, chain, index);
+        }
+        DeviceKey::from_secret_bytes(key)
+    }
+}
+
+fn account_node(seed: &[u8; 32]) -> ([u8; 32], [u8; 32]) {
+    let (key, chain) = slip_master(seed);
+    let (key, chain) = slip_child(key, chain, 0x8000_0000 | 30211);
+    let (key, chain) = slip_child(key, chain, 0x8000_0000);
+    slip_child(key, chain, 0x8000_0000)
+}
+
+fn slip_master(seed: &[u8]) -> ([u8; 32], [u8; 32]) {
+    split_mac(hmac_sha512(b"ed25519 seed", seed))
+}
+
+fn slip_child(key: [u8; 32], chain: [u8; 32], index: u32) -> ([u8; 32], [u8; 32]) {
+    let mut data = [0u8; 37];
+    data[0] = 0;
+    data[1..33].copy_from_slice(&key);
+    data[33..37].copy_from_slice(&index.to_be_bytes());
+    split_mac(hmac_sha512(&chain, &data))
+}
+
+fn split_mac(mac: [u8; 64]) -> ([u8; 32], [u8; 32]) {
+    let mut key = [0u8; 32];
+    let mut chain = [0u8; 32];
+    key.copy_from_slice(&mac[..32]);
+    chain.copy_from_slice(&mac[32..]);
+    (key, chain)
+}
+
+fn hmac_sha512(key: &[u8], data: &[u8]) -> [u8; 64] {
+    let mut mac = Hmac::<Sha512>::new_from_slice(key).expect("hmac-sha512");
+    mac.update(data);
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&bytes);
+    out
 }
 
 fn parse_public(hex_value: &str) -> Result<PublicKey, Error> {
@@ -142,21 +237,89 @@ pub fn aggregate_signature(
     Ok(hex::encode(bytes))
 }
 
+/// Key and signature are hex or base64. Hex wins when it decodes to `expected` bytes.
+fn decode_material(token: &str, expected: usize, name: &str) -> Result<Vec<u8>, Error> {
+    let compact: String = token.split_whitespace().collect();
+    if compact.is_empty() {
+        let empty = if name == "подпись" {
+            "подпись пуста".to_string()
+        } else {
+            format!("{name} пуст")
+        };
+        return Err(Error::msg(empty));
+    }
+    let mut wrong_len = None;
+    let hex_alphabet = compact.chars().all(|ch| ch.is_ascii_hexdigit());
+    if hex_alphabet && compact.len() % 2 == 0 {
+        if let Ok(bytes) = hex::decode(&compact) {
+            if let Some(bytes) = take_len(bytes, expected, &mut wrong_len) {
+                return Ok(bytes);
+            }
+        }
+    }
+    for decoded in [
+        B64.decode(&compact),
+        STANDARD_NO_PAD.decode(&compact),
+        URL_SAFE.decode(&compact),
+        URL_SAFE_NO_PAD.decode(&compact),
+    ] {
+        if let Ok(bytes) = decoded {
+            if let Some(bytes) = take_len(bytes, expected, &mut wrong_len) {
+                return Ok(bytes);
+            }
+        }
+    }
+    if let Some(got) = wrong_len {
+        return Err(Error::msg(format!(
+            "{name}: ожидалось {expected} байт, получено {got}"
+        )));
+    }
+    Err(Error::msg(format!("{name} не является hex или base64")))
+}
+
+fn take_len(bytes: Vec<u8>, expected: usize, wrong_len: &mut Option<usize>) -> Option<Vec<u8>> {
+    if bytes.len() == expected {
+        Some(bytes)
+    } else {
+        if wrong_len.is_none() {
+            *wrong_len = Some(bytes.len());
+        }
+        None
+    }
+}
+
+/// Stored key material is hex. Returns lowercase hex, or standard base64.
+pub fn recode_hex(hex_value: &str, as_base64: bool) -> Result<String, Error> {
+    let bytes =
+        hex::decode(hex_value.trim()).map_err(|_| Error::msg("значение не является hex"))?;
+    if as_base64 {
+        Ok(B64.encode(bytes))
+    } else {
+        Ok(hex::encode(bytes))
+    }
+}
+
+/// Exact UTF-8 text of a stored message. The bytes are not trimmed.
+pub fn message_text(message_hex: &str) -> Result<String, Error> {
+    let bytes =
+        hex::decode(message_hex.trim()).map_err(|_| Error::msg("сообщение не является hex"))?;
+    String::from_utf8(bytes).map_err(|_| Error::msg("сообщение не является текстом UTF-8"))
+}
+
+/// `verifying_key_hex` is 32 bytes and `signature_hex` is 64 bytes, each hex or base64.
 pub fn verify_ed25519(
     verifying_key_hex: &str,
     message: &[u8],
     signature_hex: &str,
 ) -> Result<(), Error> {
-    let vk_bytes =
-        hex::decode(verifying_key_hex).map_err(|_| Error::msg("ключ проверки не является hex"))?;
-    let sig_bytes =
-        hex::decode(signature_hex).map_err(|_| Error::msg("подпись не является hex"))?;
+    let vk_bytes = decode_material(verifying_key_hex, 32, "ключ проверки")?;
+    let sig_bytes = decode_material(signature_hex, 64, "подпись")?;
     let vk_bytes: [u8; 32] = vk_bytes
         .try_into()
-        .map_err(|_| Error::msg("ключ проверки Ed25519 должен быть 32 байта"))?;
+        .map_err(|_| Error::msg("ключ проверки: ожидалось 32 байт"))?;
     let sig_bytes: [u8; 64] = sig_bytes
         .try_into()
-        .map_err(|_| Error::msg("подпись Ed25519 должна быть 64 байта"))?;
+        .map_err(|_| Error::msg("подпись: ожидалось 64 байт"))?;
     let verifying_key = VerifyingKey::from_bytes(&vk_bytes)
         .map_err(|err| Error::msg(format!("ключ Ed25519: {err}")))?;
     let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
@@ -688,6 +851,23 @@ mod tests {
     use crate::MemberDto;
 
     #[test]
+    fn hd_group_keys_follow_the_group_id() {
+        let identity = HdIdentity::generate();
+        let seed = identity.seed();
+        let group_a = Uuid::new_v4();
+        let group_b = Uuid::new_v4();
+        let account = identity.account_key().public_hex();
+        let first = identity.group_key(group_a).public_hex();
+        let second = identity.group_key(group_b).public_hex();
+        assert_ne!(account, first);
+        assert_ne!(first, second);
+        assert_eq!(first, identity.group_key(group_a).public_hex());
+        let restored = HdIdentity::from_seed(seed);
+        assert_eq!(restored.account_key().public_hex(), account);
+        assert_eq!(restored.group_key(group_a).public_hex(), first);
+    }
+
+    #[test]
     fn device_seal_roundtrip() {
         let alice = DeviceKey::generate();
         let bob = DeviceKey::generate();
@@ -844,5 +1024,110 @@ mod tests {
             other => panic!("unexpected relay {other:?}"),
         };
         outgoing.extend(peer.handle(&server).unwrap());
+    }
+
+    #[test]
+    fn verify_accepts_hex_and_base64() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing = SigningKey::from_bytes(&[7u8; 32]);
+        let message = b"invoice-42";
+        let signature = signing.sign(message);
+        let key_bytes = signing.verifying_key().to_bytes();
+        let sig_bytes = signature.to_bytes();
+        let key_hex = hex::encode(key_bytes);
+        let sig_hex = hex::encode(sig_bytes);
+        let key_b64 = STANDARD.encode(key_bytes);
+        let sig_b64 = STANDARD.encode(sig_bytes);
+
+        verify_ed25519(&key_hex, message, &sig_hex).unwrap();
+        verify_ed25519(&key_b64, message, &sig_b64).unwrap();
+        verify_ed25519(&key_hex, message, &sig_b64).unwrap();
+        verify_ed25519(&key_b64, message, &sig_hex).unwrap();
+
+        let spaced_key: String = key_hex
+            .chars()
+            .enumerate()
+            .flat_map(|(index, ch)| {
+                if index > 0 && index % 8 == 0 {
+                    vec![' ', ch]
+                } else {
+                    vec![ch]
+                }
+            })
+            .collect();
+        verify_ed25519(&spaced_key, message, &sig_hex).unwrap();
+        let spaced_sig = format!(" {sig_b64} ");
+        verify_ed25519(&key_hex, message, &spaced_sig).unwrap();
+
+        let key_nopad = key_b64.trim_end_matches('=').to_string();
+        verify_ed25519(&key_nopad, message, &sig_hex).unwrap();
+        let key_url = URL_SAFE_NO_PAD.encode(key_bytes);
+        verify_ed25519(&key_url, message, &sig_b64).unwrap();
+
+        let upper = key_hex.to_uppercase();
+        assert_eq!(recode_hex(&upper, false).unwrap(), key_hex);
+        assert_eq!(recode_hex(&key_hex, true).unwrap(), key_b64);
+
+        let with_newline = b"invoice-42\n";
+        let newline_sig = hex::encode(signing.sign(with_newline).to_bytes());
+        verify_ed25519(&key_hex, with_newline, &newline_sig).unwrap();
+        assert_eq!(
+            verify_ed25519(&key_hex, message, &newline_sig)
+                .unwrap_err()
+                .to_string(),
+            "подпись не прошла проверку Ed25519"
+        );
+        assert_eq!(
+            message_text(&hex::encode(with_newline)).unwrap(),
+            "invoice-42\n"
+        );
+
+        assert_eq!(
+            verify_ed25519("", message, &sig_hex)
+                .unwrap_err()
+                .to_string(),
+            "ключ проверки пуст"
+        );
+        assert_eq!(
+            verify_ed25519(&key_hex, message, "  ")
+                .unwrap_err()
+                .to_string(),
+            "подпись пуста"
+        );
+        assert_eq!(
+            verify_ed25519("aa", message, &sig_hex)
+                .unwrap_err()
+                .to_string(),
+            "ключ проверки: ожидалось 32 байт, получено 1"
+        );
+        assert_eq!(
+            verify_ed25519(&key_hex, message, "aa")
+                .unwrap_err()
+                .to_string(),
+            "подпись: ожидалось 64 байт, получено 1"
+        );
+        assert_eq!(
+            verify_ed25519("@@@", message, &sig_hex)
+                .unwrap_err()
+                .to_string(),
+            "ключ проверки не является hex или base64"
+        );
+        assert_eq!(
+            verify_ed25519(&key_hex, b"invoice-43", &sig_hex)
+                .unwrap_err()
+                .to_string(),
+            "подпись не прошла проверку Ed25519"
+        );
+        assert_eq!(
+            message_text("ff").unwrap_err().to_string(),
+            "сообщение не является текстом UTF-8"
+        );
+        assert_eq!(
+            message_text("zz").unwrap_err().to_string(),
+            "сообщение не является hex"
+        );
     }
 }

@@ -6,6 +6,7 @@ use rusqlite::{Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::config::default_database_path;
+use crate::vault::Vault;
 use crate::{private_files, tighten};
 
 const TOKEN: &str = "token";
@@ -13,6 +14,7 @@ const USER_ID: &str = "user_id";
 const USERNAME: &str = "username";
 const ROLE: &str = "role";
 const DEVICE_SECRET: &str = "device_secret";
+const VAULT: &str = "vault";
 
 pub struct Store {
     conn: Connection,
@@ -96,20 +98,26 @@ impl Store {
         self.delete_kv(ROLE)
     }
 
-    pub fn device_secret(&self) -> Result<Option<String>, String> {
-        self.get_kv(DEVICE_SECRET)
+    pub fn vault_record(&self) -> Result<Option<String>, String> {
+        self.get_kv(VAULT)
     }
 
-    pub fn save_device_secret(&self, secret: &str) -> Result<(), String> {
-        self.set_kv(DEVICE_SECRET, secret)
+    pub fn save_vault_record(&self, record: &str) -> Result<(), String> {
+        self.set_kv(VAULT, record)
+    }
+
+    /// Removes a device secret left from a build that stored it in the clear.
+    pub fn delete_device_secret(&self) -> Result<(), String> {
+        self.delete_kv(DEVICE_SECRET)
     }
 
     pub fn load_share(
         &self,
         user_id: Uuid,
         group_id: Uuid,
+        vault: &Vault,
     ) -> Result<Option<ParticipantBlobDto>, String> {
-        let json: Option<String> = self
+        let stored: Option<String> = self
             .conn
             .query_row(
                 "SELECT blob FROM shares WHERE user_id = ?1 AND group_id = ?2",
@@ -118,8 +126,18 @@ impl Store {
             )
             .optional()
             .map_err(|err| err.to_string())?;
-        json.map(|json| serde_json::from_str(&json).map_err(|err| err.to_string()))
-            .transpose()
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored.trim_start().starts_with('{') {
+            let blob = serde_json::from_str(&stored).map_err(|err| err.to_string())?;
+            self.save_share(user_id, group_id, &blob, vault)?;
+            return Ok(Some(blob));
+        }
+        let json = vault.open_share(&stored)?;
+        serde_json::from_str(&json)
+            .map(Some)
+            .map_err(|err| err.to_string())
     }
 
     pub fn save_share(
@@ -127,13 +145,15 @@ impl Store {
         user_id: Uuid,
         group_id: Uuid,
         blob: &ParticipantBlobDto,
+        vault: &Vault,
     ) -> Result<(), String> {
         let json = serde_json::to_string(blob).map_err(|err| err.to_string())?;
+        let sealed = vault.seal_share(&json)?;
         self.conn
             .execute(
                 "INSERT INTO shares (user_id, group_id, blob) VALUES (?1, ?2, ?3)
                  ON CONFLICT(user_id, group_id) DO UPDATE SET blob = excluded.blob",
-                (user_id.to_string(), group_id.to_string(), json),
+                (user_id.to_string(), group_id.to_string(), sealed),
             )
             .map_err(|err| err.to_string())?;
         Ok(())
@@ -176,6 +196,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ai-signing-db-{}", Uuid::new_v4()));
         let path = dir.join("nested").join("client.sqlite");
         let store = Store::open_path(&path).unwrap();
+        let vault = crate::vault::Vault::unlock_or_create(&store, "password1").unwrap();
         let user = Uuid::new_v4();
         let group = Uuid::new_v4();
         let blob = ParticipantBlobDto {
@@ -184,10 +205,13 @@ mod tests {
             pubkey: Some("pub".into()),
             signs: vec![],
         };
-        store.save_share(user, group, &blob).unwrap();
-        let loaded = store.load_share(user, group).unwrap().unwrap();
+        store.save_share(user, group, &blob, &vault).unwrap();
+        let loaded = store.load_share(user, group, &vault).unwrap().unwrap();
         assert_eq!(loaded.key.as_deref(), Some("share"));
-        assert!(store.load_share(user, Uuid::new_v4()).unwrap().is_none());
+        assert!(store
+            .load_share(user, Uuid::new_v4(), &vault)
+            .unwrap()
+            .is_none());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

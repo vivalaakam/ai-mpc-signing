@@ -36,8 +36,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/me/device", put(set_device))
         .route("/api/groups", get(list_groups).post(create_group))
         .route("/api/groups/{id}", get(get_group))
+        .route("/api/groups/{id}/device", put(set_group_device))
         .route("/api/groups/{id}/members", post(add_member))
         .route("/api/groups/{id}/dkg", post(start_dkg))
+        .route("/api/groups/{id}/requests", post(create_sign_request))
         .route("/api/inbox", get(inbox))
         .route("/api/signing-requests/{id}/approve", post(approve))
         .route("/api/signing-requests/{id}/reject", post(reject))
@@ -360,6 +362,52 @@ async fn set_device(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn set_group_device(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(group_id): Path<Uuid>,
+    Json(body): Json<DeviceKeyRequest>,
+) -> Result<StatusCode, ApiError> {
+    let bytes = hex::decode(body.public_key_hex.trim())
+        .map_err(|_| bad("публичный ключ не является hex"))?;
+    if bytes.len() != 32 {
+        return Err(bad("публичный ключ участника должен быть 32 байта"));
+    }
+    let public_hex = hex::encode(bytes);
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT g.status, gm.box_public
+         FROM group_members gm
+         JOIN groups g ON g.id = gm.group_id
+         WHERE gm.group_id = $1 AND gm.user_id = $2",
+    )
+    .bind(group_id)
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    let Some((status, current)) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "вы не участник этой группы",
+        ));
+    };
+    if current.as_deref() == Some(public_hex.as_str()) {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    if status != "forming" {
+        return Err(bad("ключ участника уже зафиксирован"));
+    }
+    sqlx::query("UPDATE group_members SET box_public = $3 WHERE group_id = $1 AND user_id = $2")
+        .bind(group_id)
+        .bind(user.id)
+        .bind(&public_hex)
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::db)?;
+    publish_group(&state, group_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn list_groups(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -570,6 +618,35 @@ async fn start_dkg(
     ))
 }
 
+async fn create_sign_request(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateSignBody>,
+) -> Result<(StatusCode, Json<SignRequestDto>), ApiError> {
+    if user.role != ROLE_ADMIN {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "запрос на подпись создаёт администратор",
+        ));
+    }
+    let group = db::load_group(&state.pool, id, user.id)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::new(StatusCode::NOT_FOUND, "группа не найдена"),
+            other => ApiError::db(other),
+        })?;
+    if !group.i_created {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "отправлять на подпись может создатель группы",
+        ));
+    }
+    let message = decode_sign_message(&body).map_err(|err| bad(err.to_string()))?;
+    let request = ceremony::create_request(&state, id, message).await?;
+    Ok((StatusCode::CREATED, Json(request)))
+}
+
 async fn inbox(
     State(state): State<AppState>,
     user: CurrentUser,
@@ -588,7 +665,7 @@ async fn approve(
 ) -> Result<Json<SignRequestDto>, ApiError> {
     ceremony::decide(&state, user.id, id, true).await?;
     Ok(Json(
-        db::load_request(&state.pool, id, user.id)
+        db::load_request(&state.pool, id, user.id, false)
             .await
             .map_err(ApiError::db)?,
     ))
@@ -601,7 +678,7 @@ async fn reject(
 ) -> Result<Json<SignRequestDto>, ApiError> {
     ceremony::decide(&state, user.id, id, false).await?;
     Ok(Json(
-        db::load_request(&state.pool, id, user.id)
+        db::load_request(&state.pool, id, user.id, false)
             .await
             .map_err(ApiError::db)?,
     ))
@@ -662,7 +739,7 @@ async fn external_get(
     if owner != Some(id) {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "запрос не найден"));
     }
-    let request = db::load_request(&state.pool, request_id, Uuid::nil())
+    let request = db::load_request(&state.pool, request_id, Uuid::nil(), true)
         .await
         .map_err(ApiError::db)?;
     Ok(Json(status_of(&request)))

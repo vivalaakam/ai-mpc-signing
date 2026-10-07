@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
 use ai_signing_client::{
-    listen, parse_args, role_title, Cmd, Config, GroupDto, SignRequestDto, Store, UiState,
+    listen, message_text, parse_args, recode_hex, role_title, Cmd, Config, GroupDto,
+    SignRequestDto, Store, UiState,
 };
 use async_channel::Sender;
 use gpui_kit::component::{
@@ -13,8 +14,8 @@ use gpui_kit::component::{
     v_flex, ActiveTheme as _, Disableable as _,
 };
 use gpui_kit::{
-    div, point, prelude::*, px, size, App, Bounds, Context, Entity, IntoElement, Render,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, point, prelude::*, px, size, App, Bounds, ClipboardItem, Context, Entity, IntoElement,
+    Render, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use uuid::Uuid;
 
@@ -28,7 +29,7 @@ fn main() {
     };
     if launch.rest.iter().any(|arg| arg == "--help" || arg == "-h") {
         println!(
-            "Подпись MPC\n\n  ai-signing-gui [--config ПУТЬ] [--database ПУТЬ]\n\nАдрес сервера задаётся в конфиге, поле server."
+            "Подпись MPC\n\n  ai-signing-gui [--config ПУТЬ] [--database ПУТЬ]\n\nАдрес сервера задаётся в конфиге, поле server.\nНа подписанном сообщении администратор копирует ключ, подпись и текст в hex или base64.\nПроверка подписи: ai-signing-cli verify."
         );
         return;
     }
@@ -99,7 +100,9 @@ struct AppView {
     password: Entity<InputState>,
     group_name: Entity<InputState>,
     threshold: Entity<InputState>,
+    message: Entity<InputState>,
     picked: HashSet<String>,
+    copy_base64: bool,
 }
 
 impl AppView {
@@ -110,7 +113,12 @@ impl AppView {
         events: async_channel::Receiver<UiState>,
         initial: UiState,
     ) -> Self {
-        let username = cx.new(|cx| InputState::new(window, cx).placeholder("имя"));
+        let preset = initial.username.clone().unwrap_or_default();
+        let username = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("имя")
+                .default_value(preset)
+        });
         let password = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("пароль")
@@ -122,6 +130,7 @@ impl AppView {
                 .placeholder("2")
                 .default_value("2")
         });
+        let message = cx.new(|cx| InputState::new(window, cx).placeholder("текст сообщения"));
         cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 if this
@@ -146,7 +155,9 @@ impl AppView {
             password,
             group_name,
             threshold,
+            message,
             picked: HashSet::new(),
+            copy_base64: false,
         }
     }
 
@@ -197,6 +208,12 @@ impl AppView {
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
                     .child("Пороговая подпись Ed25519. Доля ключа остаётся на этом устройстве."),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Пароль проверяется при каждом входе и открывает локальные ключи."),
             )
             .child(
                 div()
@@ -259,10 +276,10 @@ impl AppView {
             .iter()
             .filter(|request| request.status == "pending" && request.my_decision.is_none())
             .count();
-        let inbox = if pending == 0 {
-            "На подпись".to_string()
+        let inbox = if self.state.role.as_deref() == Some("admin") || pending == 0 {
+            "Сообщения".to_string()
         } else {
-            format!("На подпись ({pending})")
+            format!("Сообщения ({pending})")
         };
         v_flex()
             .size_full()
@@ -685,22 +702,114 @@ impl AppView {
                         .child("Этим токеном внешний сервис создаёт запросы на подпись."),
                 )
             })
+            .when(group.i_created, |this| {
+                this.child(self.sign_form(group, cx))
+            })
+    }
+
+    fn sign_form(&mut self, group: &GroupDto, cx: &mut Context<Self>) -> impl IntoElement {
+        let group_id = group.id;
+        let busy = self.busy;
+        let message = self.message.clone();
+        let view = cx.entity();
+        v_flex()
+            .gap_2()
+            .child(labeled(
+                "Сообщение",
+                Input::new(&self.message).id("sign-message"),
+                cx,
+            ))
+            .child(
+                Button::new("request-sign")
+                    .primary()
+                    .label("Отправить на подпись")
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        let text = message.read(cx).value().trim().to_string();
+                        view.update(cx, |this, cx| {
+                            if text.is_empty() {
+                                this.state.error = Some("Введите сообщение".into());
+                                cx.notify();
+                                return;
+                            }
+                            this.send(
+                                Cmd::RequestSign {
+                                    group_id,
+                                    message: text,
+                                },
+                                cx,
+                            );
+                        });
+                    }),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Подписанты увидят сообщение и подтвердят подпись."),
+            )
     }
 
     fn inbox_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_admin = self.state.role.as_deref() == Some("admin");
         if self.state.requests.is_empty() {
-            return empty("Запросов на подпись нет.").into_any_element();
+            let text = if is_admin {
+                "Подписанных сообщений пока нет."
+            } else {
+                "Сообщений пока нет."
+            };
+            return empty(text).into_any_element();
         }
         let requests = self.state.requests.clone();
-        let mut cards = Vec::new();
-        for request in &requests {
-            cards.push(self.request_card(request, cx).into_any_element());
+        if !is_admin {
+            let mut cards = Vec::new();
+            for request in &requests {
+                cards.push(self.request_card(request, cx).into_any_element());
+            }
+            return div()
+                .id("inbox")
+                .size_full()
+                .overflow_y_scrollbar()
+                .child(v_flex().gap_3().children(cards))
+                .into_any_element();
         }
+        let waiting: Vec<_> = requests
+            .iter()
+            .filter(|request| request.status != "completed")
+            .cloned()
+            .collect();
+        let signed: Vec<_> = requests
+            .iter()
+            .filter(|request| request.status == "completed")
+            .cloned()
+            .collect();
+        let mut body = v_flex().gap_4();
+        if !waiting.is_empty() {
+            let mut cards = Vec::new();
+            for request in &waiting {
+                cards.push(self.request_card(request, cx).into_any_element());
+            }
+            body = body
+                .child(section_title("Ждут подписи"))
+                .child(v_flex().gap_3().children(cards));
+        }
+        let signed_body = if signed.is_empty() {
+            div().text_sm().child("Пока нет.").into_any_element()
+        } else {
+            let mut cards = Vec::new();
+            for request in &signed {
+                cards.push(self.request_card(request, cx).into_any_element());
+            }
+            v_flex().gap_3().children(cards).into_any_element()
+        };
         div()
             .id("inbox")
             .size_full()
             .overflow_y_scrollbar()
-            .child(v_flex().gap_3().children(cards))
+            .child(
+                body.child(section_title("Подписанные сообщения"))
+                    .child(signed_body),
+            )
             .into_any_element()
     }
 
@@ -716,9 +825,30 @@ impl AppView {
             .copied()
             .unwrap_or(false);
         let view = cx.entity();
+        let card = view.clone();
         let request_id = request.id;
         let busy = self.busy;
         let can_decide = request.status == "pending" && request.my_decision.is_none();
+        let is_admin = self.state.role.as_deref() == Some("admin");
+        let copy_base64 = self.copy_base64;
+        let group_found = self
+            .state
+            .groups
+            .iter()
+            .any(|group| group.id == request.group_id);
+        let key_hex = self
+            .state
+            .groups
+            .iter()
+            .find(|group| group.id == request.group_id)
+            .and_then(|group| group.verifying_key_hex.clone());
+        let signature_hex = request.signature_hex.clone().unwrap_or_default();
+        let message_hex = request.message_hex.clone();
+        let waiting = if is_admin {
+            "Запрос ждёт решения подписантов."
+        } else {
+            "На этом устройстве нет доли ключа, подтвердить подпись нельзя."
+        };
         v_flex()
             .gap_2()
             .p_3()
@@ -781,9 +911,7 @@ impl AppView {
                         ),
                 )
             })
-            .when(can_decide && !has_share, |this| {
-                this.child("На этом устройстве нет доли ключа, подтвердить подпись нельзя.")
-            })
+            .when(can_decide && !has_share, |this| this.child(waiting))
             .when(request.my_decision.as_deref() == Some("approved"), |this| {
                 this.child("Вы подтвердили подпись.")
             })
@@ -793,6 +921,29 @@ impl AppView {
             .when(request.status == "signing", |this| {
                 this.child("Идёт сбор подписи.")
             })
+            .when(request.status == "completed" && !is_admin, |this| {
+                this.child("Всё прошло.")
+            })
+            .when(
+                request.status == "completed"
+                    && is_admin
+                    && request
+                        .signature_hex
+                        .as_deref()
+                        .is_some_and(|signature| !signature.is_empty()),
+                |this| {
+                    this.child(admin_signed(
+                        request_id,
+                        &signature_hex,
+                        group_found,
+                        key_hex.as_deref(),
+                        &message_hex,
+                        copy_base64,
+                        card,
+                        cx,
+                    ))
+                },
+            )
             .when(request.error.is_some(), |this| {
                 this.child(
                     div()
@@ -800,21 +951,12 @@ impl AppView {
                         .child(request.error.clone().unwrap_or_default()),
                 )
             })
-            .when(request.signature_hex.is_some(), |this| {
-                let signature = request.signature_hex.clone().unwrap_or_default();
-                this.child(copy_line(
-                    format!("sig-{request_id}"),
-                    "Подпись",
-                    &signature,
-                    cx,
-                ))
-            })
     }
 }
 
 impl Render for AppView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let body = if self.state.username.is_none() {
+        let body = if !self.state.unlocked {
             self.login_screen(cx).into_any_element()
         } else {
             self.workspace(cx).into_any_element()
@@ -900,6 +1042,173 @@ fn copy_line(id: String, title: &str, value: &str, cx: &App) -> impl IntoElement
                 .value(value.to_string())
                 .tooltip("Копировать"),
         )
+}
+
+fn admin_signed(
+    request_id: Uuid,
+    signature_hex: &str,
+    group_found: bool,
+    key_hex: Option<&str>,
+    message_hex: &str,
+    copy_base64: bool,
+    view: Entity<AppView>,
+    cx: &App,
+) -> impl IntoElement {
+    let key = encode_key(group_found, key_hex, copy_base64);
+    let signature = recode_hex(signature_hex, copy_base64).map_err(|err| err.to_string());
+    let message = message_text(message_hex).map_err(|err| err.to_string());
+    let format_label = if copy_base64 {
+        "Формат: base64"
+    } else {
+        "Формат: hex"
+    };
+    v_flex()
+        .gap_2()
+        .child(value_block("Публичный ключ", &key, true, cx))
+        .child(value_block("Подпись", &signature, true, cx))
+        .child(value_block("Сообщение", &message, false, cx))
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("Проверка в отдельном окне: ai-signing-cli verify"),
+        )
+        .child(
+            Button::new(format!("fmt-{request_id}"))
+                .ghost()
+                .label(format_label)
+                .on_click({
+                    let view = view.clone();
+                    move |_, _, cx| {
+                        view.update(cx, |this, cx| {
+                            this.copy_base64 = !this.copy_base64;
+                            let name = if this.copy_base64 { "base64" } else { "hex" };
+                            this.state.error = None;
+                            this.state.notice = Some(format!("Формат копирования: {name}"));
+                            cx.notify();
+                        });
+                    }
+                }),
+        )
+        .child(
+            h_flex()
+                .gap_2()
+                .child(copy_action(
+                    format!("copy-key-{request_id}"),
+                    "Копировать публичный ключ",
+                    key.ok(),
+                    "Ключ скопирован",
+                    view.clone(),
+                ))
+                .child(copy_action(
+                    format!("copy-sig-{request_id}"),
+                    "Копировать подпись",
+                    signature.ok(),
+                    "Подпись скопирована",
+                    view.clone(),
+                ))
+                .child(copy_action(
+                    format!("copy-msg-{request_id}"),
+                    "Копировать сообщение",
+                    message.ok(),
+                    "Сообщение скопировано",
+                    view,
+                )),
+        )
+}
+
+fn encode_key(group_found: bool, key_hex: Option<&str>, as_base64: bool) -> Result<String, String> {
+    if !group_found {
+        return Err("Группа не найдена".into());
+    }
+    let Some(key) = key_hex.filter(|key| !key.is_empty()) else {
+        return Err("У группы нет публичного ключа".into());
+    };
+    recode_hex(key, as_base64).map_err(|err| err.to_string())
+}
+
+fn value_block(
+    title: &str,
+    value: &Result<String, String>,
+    mono: bool,
+    cx: &App,
+) -> impl IntoElement {
+    let body = match value {
+        Ok(text) => {
+            let lines = if mono {
+                wrap_chunks(text, 64)
+            } else if text.is_empty() {
+                vec![String::new()]
+            } else {
+                text.split('\n').map(|line| line.to_string()).collect()
+            };
+            v_flex()
+                .gap_1()
+                .children(lines.into_iter().map(|line| {
+                    let mut row = div().text_xs().child(if line.is_empty() {
+                        " ".to_string()
+                    } else {
+                        line
+                    });
+                    if mono {
+                        row = row.font_family(cx.theme().mono_font_family.clone());
+                    }
+                    row
+                }))
+                .into_any_element()
+        }
+        Err(err) => div()
+            .text_sm()
+            .text_color(cx.theme().danger)
+            .child(err.clone())
+            .into_any_element(),
+    };
+    v_flex()
+        .gap_1()
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child(title.to_string()),
+        )
+        .child(body)
+}
+
+fn wrap_chunks(value: &str, size: usize) -> Vec<String> {
+    value
+        .as_bytes()
+        .chunks(size)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect()
+}
+
+fn copy_action(
+    id: String,
+    label: &str,
+    text: Option<String>,
+    notice: &'static str,
+    view: Entity<AppView>,
+) -> impl IntoElement {
+    let available = text.is_some();
+    let text = text.unwrap_or_default();
+    Button::new(id)
+        .label(label.to_string())
+        .disabled(!available)
+        .on_click(move |_, _, cx| {
+            if !available {
+                return;
+            }
+            cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+            view.update(cx, |this, cx| {
+                this.state.error = None;
+                this.state.notice = Some(notice.into());
+                cx.notify();
+            });
+        })
+}
+
+fn section_title(text: &str) -> impl IntoElement {
+    div().text_sm().child(text.to_string())
 }
 
 fn empty(text: &str) -> impl IntoElement {

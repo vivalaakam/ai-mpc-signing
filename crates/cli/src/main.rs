@@ -1,4 +1,5 @@
 mod tui;
+mod verify;
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -17,13 +18,16 @@ const HELP: &str = "\
   ai-signing-cli [--config ПУТЬ] [--database ПУТЬ] КОМАНДА
 
 Без команды открывается текстовый интерфейс. Он держит связь с сервером
-и участвует в протоколе. Адрес сервера берётся из конфига, поле server.
+и участвует в протоколе. Вход каждый раз спрашивает пароль: им зашифрованы
+личный ключ и доли ключей на этом устройстве. Адрес сервера берётся из конфига, поле server.
 Если конфига ещё нет, он создаётся с адресом http://127.0.0.1:8080.
 Переменная AI_SIGNING_HOME задаёт каталог конфига и базы, когда пути не переданы.
 
-В интерфейсе: q закрыть, w выйти из учётной записи, u обновить, Tab вкладка,
-j/k выбор. Админ: n новая группа, d генерация ключа. Подписант: a подписать,
-r отклонить. В новой группе пробел отмечает подписанта, Enter создаёт группу.
+В интерфейсе: Ctrl+Q выйти из учётной записи, Ctrl+W закрыть, u обновить, Tab вкладка,
+j/k выбор. Админ: n новая группа, d генерация ключа, s сообщение на подпись.
+На подписанном сообщении: 1 копировать ключ, 2 подпись, 3 сообщение, f формат hex или base64.
+Подписант: a подписать, r отклонить. В новой группе пробел отмечает подписанта,
+Enter создаёт группу. На экране сообщения Enter отправляет текст.
 
 Команды:
   login ИМЯ ПАРОЛЬ                 войти
@@ -35,10 +39,12 @@ r отклонить. В новой группе пробел отмечает �
   create-group НАЗВАНИЕ T ИМЯ...   создать группу, 2 ≤ t ≤ n ≤ 16
   add-member ID ИМЯ                добавить участника в недособранную группу
   start-dkg ID                     запустить генерацию ключа
+  request-sign ID СООБЩЕНИЕ...     отправить текст на подпись в активную группу
   inbox                            запросы на подпись
   approve ID                       подтвердить подпись
   reject ID                        отклонить запрос
-  watch                            держать связь без интерфейса
+  watch ПАРОЛЬ                     держать связь: пароль открывает локальные ключи
+  verify                           проверить подпись в отдельном окне, без входа
 
 Группу создаёт администратор и сразу выбирает подписантов.
 Активный подписант уже входил в клиент, у него есть ключ устройства.
@@ -66,15 +72,18 @@ fn run() -> Result<(), String> {
         let (store, server) = open(&launch)?;
         return tui::run(store, server, &launch.database_path);
     }
-    let socket = socket_path_for(&launch.database_path)?;
     let command = launch.rest[0].as_str();
     let args = &launch.rest[1..];
+    if command == "verify" {
+        return verify::run(args);
+    }
+    let socket = socket_path_for(&launch.database_path)?;
     if command == "watch" {
-        if !args.is_empty() {
-            return Err("watch не принимает аргументы".into());
+        if args.len() != 1 || args[0].is_empty() {
+            return Err("использование: watch ПАРОЛЬ".into());
         }
         let (store, server) = open(&launch)?;
-        return watch(store, server, &socket);
+        return watch(store, server, &socket, &args[0]);
     }
     let (cmd, kind) = parse_command(command, args)?;
     if let Some(reply) = try_forward(&socket, &cmd)? {
@@ -110,6 +119,7 @@ enum Kind {
     Signers,
     Decide,
     StartDkg,
+    RequestSign,
 }
 
 fn parse_command(command: &str, args: &[String]) -> Result<(Cmd, Kind), String> {
@@ -184,6 +194,23 @@ fn parse_command(command: &str, args: &[String]) -> Result<(Cmd, Kind), String> 
                 Kind::StartDkg,
             ))
         }
+        "request-sign" => {
+            if args.len() < 2 {
+                return Err("использование: request-sign ID СООБЩЕНИЕ...".into());
+            }
+            let message = args[1..].join(" ");
+            let message = message.trim().to_string();
+            if message.is_empty() {
+                return Err("укажите сообщение".into());
+            }
+            Ok((
+                Cmd::RequestSign {
+                    group_id: parse_id(&args[0], "группы")?,
+                    message,
+                },
+                Kind::RequestSign,
+            ))
+        }
         "inbox" => {
             need(0, "inbox")?;
             Ok((Cmd::Refresh, Kind::Inbox))
@@ -248,7 +275,7 @@ fn emit(kind: Kind, reply: Reply) -> Result<(), String> {
         }
         Kind::Inbox => print_json(&reply.requests),
         Kind::Signers => print_json(&reply.signers),
-        Kind::Decide => {
+        Kind::Decide | Kind::RequestSign => {
             let request = reply
                 .request
                 .ok_or_else(|| "сервер не вернул запрос".to_string())?;

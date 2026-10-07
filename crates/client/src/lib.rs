@@ -7,8 +7,11 @@ mod config;
 mod control;
 mod session;
 mod store;
+mod vault;
 
-pub use ai_signing_protocol::{role_title, GroupDto, SignRequestDto, SignerDto};
+pub use ai_signing_protocol::{
+    message_text, recode_hex, role_title, GroupDto, SignRequestDto, SignerDto,
+};
 pub use config::{
     default_config_path, default_database_path, parse_args, socket_path_for, Config, Launch,
 };
@@ -33,8 +36,8 @@ pub(crate) fn tighten(path: &std::path::Path, mode: u32) {
     let _ = (path, mode);
 }
 
-/// Key shares are written to the database and to its WAL. Later files in this
-/// process should stay private even when the parent directory is `/tmp`.
+/// Key shares are written to the database and to its WAL as ciphertext. Later
+/// files in this process should stay private even when the parent directory is `/tmp`.
 pub(crate) fn private_files() {
     #[cfg(unix)]
     // umask(2) меняет маску только этого процесса.

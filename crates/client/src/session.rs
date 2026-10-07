@@ -5,8 +5,8 @@ use std::{
 };
 
 use ai_signing_protocol::{
-    role_title, AuthResponse, ClientMsg, DeviceKey, GroupDto, Participant, ServerMsg,
-    SignRequestDto, SignerDto, UserProfile, ROLE_ADMIN,
+    role_title, AuthResponse, ClientMsg, GroupDto, Participant, ServerMsg, SignRequestDto,
+    SignerDto, UserProfile, ROLE_ADMIN,
 };
 use async_channel::Sender;
 use futures::{SinkExt, StreamExt};
@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::control;
 use crate::store::Store;
+use crate::vault::Vault;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -43,6 +44,10 @@ pub enum Cmd {
     },
     StartDkg {
         group_id: Uuid,
+    },
+    RequestSign {
+        group_id: Uuid,
+        message: String,
     },
     Approve {
         request_id: Uuid,
@@ -105,6 +110,7 @@ pub struct UiState {
     pub requests: Vec<SignRequestDto>,
     pub signers: Vec<SignerDto>,
     pub shares: HashMap<Uuid, bool>,
+    pub unlocked: bool,
 }
 
 impl UiState {
@@ -120,6 +126,7 @@ impl UiState {
             requests: Vec::new(),
             signers: Vec::new(),
             shares: HashMap::new(),
+            unlocked: false,
         }
     }
 }
@@ -171,7 +178,7 @@ pub fn start(
                     }
                 };
                 let accept = control::accept(listener, accept_tx);
-                let session = run(store, server_url, true, job_rx, event_tx);
+                let session = run(store, server_url, true, None, false, job_rx, event_tx);
                 tokio::join!(bridge, accept, session);
             });
         })
@@ -180,7 +187,12 @@ pub fn start(
 }
 
 /// Keeps the ceremony running and answers CLI commands on the database socket.
-pub fn watch(store: Store, server_url: String, socket: &Path) -> Result<(), String> {
+pub fn watch(
+    store: Store,
+    server_url: String,
+    socket: &Path,
+    password: &str,
+) -> Result<(), String> {
     let listener = control::bind(socket)?;
     let _unlink = control::Unlink(socket.to_path_buf());
     eprintln!("клиент слушает {}, сервер {server_url}", socket.display());
@@ -193,7 +205,15 @@ pub fn watch(store: Store, server_url: String, socket: &Path) -> Result<(), Stri
         let (job_tx, job_rx) = async_channel::unbounded();
         let (event_tx, _event_rx) = async_channel::unbounded();
         let accept = control::accept(listener, job_tx);
-        let session = run(store, server_url, true, job_rx, event_tx);
+        let session = run(
+            store,
+            server_url,
+            true,
+            Some(password.to_string()),
+            false,
+            job_rx,
+            event_tx,
+        );
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
                 .map_err(|err| err.to_string())?;
@@ -232,7 +252,7 @@ pub fn execute(
             })
             .await
             .map_err(|_| "сессия не запустилась".to_string())?;
-        let session = run(store, server_url, connect, job_rx, event_tx);
+        let session = run(store, server_url, connect, None, true, job_rx, event_tx);
         tokio::pin!(session);
         tokio::select! {
             reply = reply_rx => reply.map_err(|_| "сессия не ответила".to_string()),
@@ -255,7 +275,7 @@ impl Drop for Conn {
 struct Session {
     store: Store,
     http: reqwest::Client,
-    device: DeviceKey,
+    vault: Option<Vault>,
     events: Sender<UiState>,
     server_url: String,
     token: Option<String>,
@@ -277,6 +297,8 @@ async fn run(
     store: Store,
     server_url: String,
     connect: bool,
+    unlock_password: Option<String>,
+    resume_session: bool,
     cmd_rx: async_channel::Receiver<Job>,
     events: Sender<UiState>,
 ) {
@@ -284,35 +306,13 @@ async fn run(
         .timeout(Duration::from_secs(20))
         .build()
         .expect("http");
-    let device = match load_device(&store) {
-        Ok(device) => device,
-        Err(err) => {
-            let _ = events.try_send(UiState {
-                server_url: server_url.clone(),
-                username: None,
-                role: None,
-                connected: false,
-                error: Some(err.clone()),
-                notice: None,
-                groups: Vec::new(),
-                requests: Vec::new(),
-                signers: Vec::new(),
-                shares: HashMap::new(),
-            });
-            if let Ok(job) = cmd_rx.recv().await {
-                if let Some(reply) = job.reply {
-                    let _ = reply.send(Reply::fatal(&server_url, err));
-                }
-            }
-            return;
-        }
-    };
     let role = store.role();
+    let remembered = store.session().map(|(_, _, username)| username);
     let mut session = Session {
         server_url: server_url.clone(),
         token: None,
         user_id: None,
-        username: None,
+        username: remembered.clone(),
         connected: false,
         error: None,
         notice: None,
@@ -325,14 +325,27 @@ async fn run(
         focus_request: None,
         store,
         http,
-        device,
+        vault: None,
         events,
     };
-    if let Some((token, user_id, username)) = session.store.session() {
-        session.token = Some(token);
-        session.user_id = Some(user_id);
-        session.username = Some(username);
-        session.restore().await;
+    if let Some(password) = unlock_password {
+        match remembered {
+            Some(username) => {
+                if let Err(err) = session.auth("/api/login", &username, &password).await {
+                    session.error = Some(err.text());
+                }
+            }
+            None => {
+                session.error = Some("сначала войдите: login ИМЯ ПАРОЛЬ".into());
+            }
+        }
+    } else if resume_session {
+        if let Some((token, user_id, username)) = session.store.session() {
+            session.token = Some(token);
+            session.user_id = Some(user_id);
+            session.username = Some(username);
+            session.restore().await;
+        }
     }
     session.emit();
 
@@ -519,15 +532,6 @@ async fn connect_ws(
     Ok((out_tx, in_rx, task))
 }
 
-fn load_device(store: &Store) -> Result<DeviceKey, String> {
-    if let Some(secret) = store.device_secret()? {
-        return DeviceKey::from_secret_hex(&secret).map_err(|err| err.to_string());
-    }
-    let device = DeviceKey::generate();
-    store.save_device_secret(&device.secret_hex())?;
-    Ok(device)
-}
-
 impl Session {
     fn ws_url(&self) -> String {
         let token = self.token.clone().unwrap_or_default();
@@ -559,6 +563,7 @@ impl Session {
             requests: self.requests.clone(),
             signers: self.signers.clone(),
             shares,
+            unlocked: self.vault.is_some(),
         });
     }
 
@@ -591,8 +596,10 @@ impl Session {
                 return;
             }
         }
-        if let Err(err) = self.upload_device().await {
-            self.error = Some(err.text());
+        if self.vault.is_some() {
+            if let Err(err) = self.upload_account_key().await {
+                self.error = Some(err.text());
+            }
         }
         match self.fetch_lists().await {
             Ok(()) => {}
@@ -623,6 +630,8 @@ impl Session {
                 self.auth("/api/login", &username, &password).await
             }
             Cmd::Logout => {
+                self.vault = None;
+                self.parties.clear();
                 self.clear_login();
                 self.error = None;
                 self.emit();
@@ -689,6 +698,23 @@ impl Session {
                     Err(err) => Err(err),
                 }
             }
+            Cmd::RequestSign { group_id, message } => {
+                let request: Result<SignRequestDto, CallError> = self
+                    .post(
+                        &format!("/api/groups/{group_id}/requests"),
+                        &serde_json::json!({ "message_utf8": message }),
+                    )
+                    .await;
+                match request {
+                    Ok(request) => {
+                        self.focus_request = Some(request.clone());
+                        self.upsert_request(request);
+                        self.notice = Some("Запрос отправлен на подпись".into());
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            }
             Cmd::Approve { request_id } => self.decide(request_id, true).await,
             Cmd::Reject { request_id } => self.decide(request_id, false).await,
             Cmd::ListSigners => {
@@ -734,7 +760,13 @@ impl Session {
         self.parties.clear();
         self.groups.clear();
         self.requests.clear();
-        self.upload_device().await?;
+        match Vault::unlock_or_create(&self.store, password) {
+            Ok(vault) => self.vault = Some(vault),
+            Err(err) => return Err(CallError::Message(err)),
+        }
+        self.upload_account_key().await?;
+        self.fetch_lists().await?;
+        self.publish_group_keys().await?;
         self.fetch_lists().await?;
         let title = role_title(self.role.as_deref().unwrap_or(""));
         self.notice = Some(format!(
@@ -773,12 +805,61 @@ impl Session {
         Ok(())
     }
 
-    async fn upload_device(&self) -> Result<(), CallError> {
+    fn group_public(&self, group_id: Uuid) -> Result<String, String> {
+        let vault = self
+            .vault
+            .as_ref()
+            .ok_or("локальные ключи закрыты: войдите с паролем")?;
+        Ok(vault.identity().group_key(group_id).public_hex())
+    }
+
+    async fn upload_account_key(&self) -> Result<(), CallError> {
+        let Some(vault) = &self.vault else {
+            return Err(CallError::Message(
+                "локальные ключи закрыты: войдите с паролем".into(),
+            ));
+        };
+        let public_key_hex = vault.identity().account_key().public_hex();
+        self.put_public("/api/me/device", &public_key_hex).await
+    }
+
+    async fn publish_group_keys(&mut self) -> Result<(), CallError> {
+        let groups = self.groups.clone();
+        for group in &groups {
+            self.ensure_group_key(group).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_group_key(&mut self, group: &GroupDto) -> Result<(), CallError> {
+        if group.my_identifier.is_none() || self.vault.is_none() {
+            return Ok(());
+        }
+        let Some(user_id) = self.user_id else {
+            return Ok(());
+        };
+        let public_key = self.group_public(group.id).map_err(CallError::Message)?;
+        let current = group
+            .members
+            .iter()
+            .find(|member| member.user_id == user_id)
+            .and_then(|member| member.box_public_hex.clone());
+        if current.as_deref() == Some(public_key.as_str()) {
+            return Ok(());
+        }
+        if group.status != "forming" && current.is_some() {
+            return Err(CallError::Message("ключ участника уже зафиксирован".into()));
+        }
+        self.put_public(&format!("/api/groups/{}/device", group.id), &public_key)
+            .await
+    }
+
+    async fn put_public(&self, path: &str, public_key_hex: &str) -> Result<(), CallError> {
         let response = self
             .http
-            .put(self.url("/api/me/device"))
+            .put(self.url(path))
             .bearer_auth(self.token.clone().unwrap_or_default())
-            .json(&serde_json::json!({ "public_key_hex": self.device.public_hex() }))
+            .json(&serde_json::json!({ "public_key_hex": public_key_hex }))
             .send()
             .await
             .map_err(|err| CallError::Message(format!("сервер недоступен: {err}")))?;
@@ -793,6 +874,9 @@ impl Session {
         let requests: Vec<SignRequestDto> = self.get("/api/inbox").await?;
         self.groups = groups;
         self.requests = requests;
+        if self.vault.is_some() {
+            self.publish_group_keys().await?;
+        }
         if self.role.as_deref() == Some(ROLE_ADMIN) {
             self.signers = self.get("/api/signers").await?;
         } else {
@@ -809,6 +893,9 @@ impl Session {
 
     fn adopt_group(&mut self, group: GroupDto) {
         self.upsert_group(group.clone());
+        if self.vault.is_none() {
+            return;
+        }
         if let Err(err) = self.with_party(&group, |party| {
             party
                 .set_group(group.clone())
@@ -836,7 +923,15 @@ impl Session {
                 self.parties
                     .retain(|id, _| self.groups.iter().any(|group| group.id == *id));
                 let groups = self.groups.clone();
+                for group in &groups {
+                    self.ensure_group_key(group)
+                        .await
+                        .map_err(|err| err.text())?;
+                }
                 for group in groups {
+                    if self.vault.is_none() {
+                        break;
+                    }
                     produced.extend(self.with_party(&group, |party| {
                         party
                             .set_group(group.clone())
@@ -846,12 +941,17 @@ impl Session {
             }
             ServerMsg::GroupUpdated { group } => {
                 let group = group.clone();
+                self.ensure_group_key(&group)
+                    .await
+                    .map_err(|err| err.text())?;
                 self.upsert_group(group.clone());
-                produced.extend(self.with_party(&group, |party| {
-                    party
-                        .set_group(group.clone())
-                        .map_err(|err| err.to_string())
-                })?);
+                if self.vault.is_some() {
+                    produced.extend(self.with_party(&group, |party| {
+                        party
+                            .set_group(group.clone())
+                            .map_err(|err| err.to_string())
+                    })?);
+                }
             }
             ServerMsg::SignRequest { request } => self.upsert_request(request.clone()),
             ServerMsg::DkgCompleted {
@@ -879,15 +979,22 @@ impl Session {
             } => {
                 let request_id = *request_id;
                 let signature_hex = signature_hex.clone();
+                let admin = self.role.as_deref() == Some(ROLE_ADMIN);
                 if let Some(request) = self
                     .requests
                     .iter_mut()
                     .find(|request| request.id == request_id)
                 {
                     request.status = "completed".into();
-                    request.signature_hex = Some(signature_hex);
+                    if admin && !signature_hex.is_empty() {
+                        request.signature_hex = Some(signature_hex);
+                    }
                 }
-                self.notice = Some("Подпись готова".into());
+                self.notice = Some(if admin {
+                    "Подпись готова".into()
+                } else {
+                    "Всё прошло".into()
+                });
             }
             ServerMsg::SignFailed {
                 request_id,
@@ -971,9 +1078,13 @@ impl Session {
         if self.parties.contains_key(&group.id) {
             return Ok(());
         }
-        let mut party = Participant::new(self.device.clone(), group.clone());
+        let Some(vault) = self.vault.as_ref() else {
+            return Err("локальные ключи закрыты: войдите с паролем".into());
+        };
+        let device = vault.identity().group_key(group.id);
+        let mut party = Participant::new(device, group.clone());
         if let Some(user_id) = self.user_id {
-            if let Some(blob) = self.store.load_share(user_id, group.id)? {
+            if let Some(blob) = self.store.load_share(user_id, group.id, vault)? {
                 party.import_state(&blob).map_err(|err| err.to_string())?;
             }
         }
@@ -988,8 +1099,11 @@ impl Session {
         let Some(party) = self.parties.get(&group_id) else {
             return Ok(());
         };
+        let Some(vault) = &self.vault else {
+            return Err("локальные ключи закрыты: войдите с паролем".into());
+        };
         let blob = party.export().map_err(|err| err.to_string())?;
-        self.store.save_share(user_id, group_id, &blob)
+        self.store.save_share(user_id, group_id, &blob, vault)
     }
 
     fn upsert_group(&mut self, group: GroupDto) {

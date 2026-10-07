@@ -11,6 +11,12 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         .await?;
     apply(pool, "001", include_str!("../migrations/001_init.sql")).await?;
     apply(pool, "002", include_str!("../migrations/002_roles.sql")).await?;
+    apply(
+        pool,
+        "003",
+        include_str!("../migrations/003_member_keys.sql"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -76,7 +82,7 @@ pub async fn load_group(
     .fetch_one(pool)
     .await?;
     let members = sqlx::query_as::<_, MemberRow>(
-        "SELECT gm.user_id, u.username, gm.identifier, u.box_public
+        "SELECT gm.user_id, u.username, gm.identifier, gm.box_public
          FROM group_members gm
          JOIN users u ON u.id = gm.user_id
          WHERE gm.group_id = $1
@@ -156,9 +162,10 @@ struct RequestRow {
     threshold: i32,
     my_decision: Option<String>,
     created_at: DateTime<Utc>,
+    created_by: Uuid,
 }
 
-fn request_dto(row: RequestRow) -> SignRequestDto {
+fn request_dto(row: RequestRow, reveal_signature: bool) -> SignRequestDto {
     SignRequestDto {
         id: row.id,
         group_id: row.group_id,
@@ -166,7 +173,7 @@ fn request_dto(row: RequestRow) -> SignRequestDto {
         message_hex: hex::encode(&row.message),
         message_preview: message_preview(&row.message),
         status: row.status,
-        signature_hex: row.signature_hex,
+        signature_hex: reveal_signature.then_some(row.signature_hex).flatten(),
         error: row.error,
         approvals: row.approvals as u16,
         threshold: row.threshold as u16,
@@ -180,7 +187,7 @@ const REQUEST_SQL: &str = "
            (SELECT count(*) FROM signing_approvals a WHERE a.request_id = r.id AND a.decision = 'approved') AS approvals,
            g.threshold,
            (SELECT decision FROM signing_approvals a WHERE a.request_id = r.id AND a.user_id = $1) AS my_decision,
-           r.created_at
+           r.created_at, g.created_by
     FROM signing_requests r
     JOIN groups g ON g.id = r.group_id
 ";
@@ -189,26 +196,35 @@ pub async fn load_request(
     pool: &PgPool,
     request_id: Uuid,
     viewer: Uuid,
+    reveal_signature: bool,
 ) -> Result<SignRequestDto, sqlx::Error> {
     let row = sqlx::query_as::<_, RequestRow>(&format!("{REQUEST_SQL} WHERE r.id = $2"))
         .bind(viewer)
         .bind(request_id)
         .fetch_one(pool)
         .await?;
-    Ok(request_dto(row))
+    let reveal = reveal_signature || row.created_by == viewer;
+    Ok(request_dto(row, reveal))
 }
 
 pub async fn list_requests(pool: &PgPool, user: Uuid) -> Result<Vec<SignRequestDto>, sqlx::Error> {
     let rows = sqlx::query_as::<_, RequestRow>(&format!(
         "{REQUEST_SQL}
          WHERE EXISTS (SELECT 1 FROM group_members m WHERE m.group_id = r.group_id AND m.user_id = $1)
+            OR g.created_by = $1
          ORDER BY r.created_at DESC
          LIMIT 50"
     ))
     .bind(user)
     .fetch_all(pool)
     .await?;
-    Ok(rows.into_iter().map(request_dto).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let reveal = row.created_by == user;
+            request_dto(row, reveal)
+        })
+        .collect())
 }
 
 pub async fn require_member(pool: &PgPool, group_id: Uuid, user: Uuid) -> Result<u16, ApiError> {

@@ -26,16 +26,51 @@ pub async fn publish_group(state: &AppState, group_id: Uuid) -> Result<(), ApiEr
     Ok(())
 }
 
+async fn publish_sign_completed(
+    state: &AppState,
+    group_id: Uuid,
+    request_id: Uuid,
+    signature: &str,
+) -> Result<(), ApiError> {
+    let creator: Option<Uuid> = sqlx::query_scalar("SELECT created_by FROM groups WHERE id = $1")
+        .bind(group_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(ApiError::db)?;
+    let users = db::audience(&state.pool, group_id)
+        .await
+        .map_err(ApiError::db)?;
+    for user in users {
+        let signature_hex = if Some(user) == creator {
+            signature.to_string()
+        } else {
+            String::new()
+        };
+        state
+            .hub
+            .publish(
+                user,
+                &ServerMsg::SignCompleted {
+                    request_id,
+                    signature_hex,
+                },
+            )
+            .await;
+    }
+    Ok(())
+}
+
 async fn publish_request(
     state: &AppState,
     request_id: Uuid,
     group_id: Uuid,
 ) -> Result<(), ApiError> {
-    let users = db::member_ids(&state.pool, group_id)
+    // Создатель группы не участник, но видит запросы, которые отправил.
+    let users = db::audience(&state.pool, group_id)
         .await
         .map_err(ApiError::db)?;
     for user in users {
-        let request = db::load_request(&state.pool, request_id, user)
+        let request = db::load_request(&state.pool, request_id, user, false)
             .await
             .map_err(ApiError::db)?;
         state
@@ -72,7 +107,7 @@ pub async fn start_dkg(state: &AppState, user: Uuid, group_id: Uuid) -> Result<(
         .find(|member| member.box_public_hex.is_none())
     {
         return Err(bad(format!(
-            "у {} ещё нет ключа устройства: пусть этот пользователь откроет приложение",
+            "у {} ещё нет ключа для этой группы: пусть этот пользователь откроет приложение",
             member.username
         )));
     }
@@ -358,7 +393,7 @@ pub async fn create_request(
     .await
     .map_err(ApiError::db)?;
     publish_request(state, request_id, group_id).await?;
-    db::load_request(&state.pool, request_id, Uuid::nil())
+    db::load_request(&state.pool, request_id, Uuid::nil(), false)
         .await
         .map_err(ApiError::db)
 }
@@ -454,7 +489,7 @@ pub async fn decide(
         .map_err(ApiError::db)?;
         tx.commit().await.map_err(ApiError::db)?;
         publish_request(state, request_id, group_id).await?;
-        let users = db::member_ids(&state.pool, group_id)
+        let users = db::audience(&state.pool, group_id)
             .await
             .map_err(ApiError::db)?;
         state
@@ -681,19 +716,7 @@ pub async fn sign_share(
             .map_err(ApiError::db)?;
             tx.commit().await.map_err(ApiError::db)?;
             publish_request(state, request_id, group_id).await?;
-            let users = db::member_ids(&state.pool, group_id)
-                .await
-                .map_err(ApiError::db)?;
-            state
-                .hub
-                .publish_all(
-                    &users,
-                    &ServerMsg::SignCompleted {
-                        request_id,
-                        signature_hex: signature,
-                    },
-                )
-                .await;
+            publish_sign_completed(state, group_id, request_id, &signature).await?;
             Ok(())
         }
         Err(err) => {
@@ -734,7 +757,7 @@ async fn fail_sign(
         return Ok(());
     }
     publish_request(state, request_id, group_id).await?;
-    let users = db::member_ids(&state.pool, group_id)
+    let users = db::audience(&state.pool, group_id)
         .await
         .map_err(ApiError::db)?;
     state

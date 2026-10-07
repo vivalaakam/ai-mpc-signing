@@ -94,6 +94,15 @@ async fn two_of_two_group_signs_an_ed25519_message() {
     let group_id = group.id;
     let api_token = group.api_token.clone().expect("создатель видит токен API");
     assert_eq!(group.members.len(), 2);
+    put_group_device(
+        &http,
+        &base,
+        &alice.token,
+        group_id,
+        &alice_device.public_hex(),
+    )
+    .await;
+    put_group_device(&http, &base, &bob.token, group_id, &bob_device.public_hex()).await;
 
     let booted = Arc::new(AtomicUsize::new(0));
     let dkg_ready = Arc::new(AtomicUsize::new(0));
@@ -290,6 +299,27 @@ async fn register(http: &reqwest::Client, base: &str, username: &str, role: &str
             .json(&json!({"username": username, "password": "password123"})),
     )
     .await
+}
+
+async fn put_group_device(
+    http: &reqwest::Client,
+    base: &str,
+    token: &str,
+    group_id: Uuid,
+    public_key_hex: &str,
+) {
+    let response = http
+        .put(format!("{base}/api/groups/{group_id}/device"))
+        .bearer_auth(token)
+        .json(&json!({"public_key_hex": public_key_hex}))
+        .send()
+        .await
+        .expect("ключ участника");
+    assert!(
+        response.status().is_success(),
+        "{}",
+        response.text().await.unwrap_or_default()
+    );
 }
 
 async fn put_device(http: &reqwest::Client, base: &str, token: &str, public_key_hex: &str) {

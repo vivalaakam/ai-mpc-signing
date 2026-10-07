@@ -3,7 +3,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use ai_signing_protocol::{verify_ed25519, GroupDto, SignRequestDto};
-use serde_json::json;
 use uuid::Uuid;
 
 struct Proc(Child);
@@ -93,8 +92,8 @@ async fn cli_two_of_two_signs_an_ed25519_message() {
 
     let alice_log = root.join("alice.watch.log");
     let bob_log = root.join("bob.watch.log");
-    let alice_watch = Proc(spawn_watch(&alice_cfg, &alice_db, &alice_log));
-    let bob_watch = Proc(spawn_watch(&bob_cfg, &bob_db, &bob_log));
+    let alice_watch = Proc(spawn_watch(&alice_cfg, &alice_db, &alice_log, password));
+    let bob_watch = Proc(spawn_watch(&bob_cfg, &bob_db, &bob_log, password));
     wait_socket(&socket_of(&alice_db), &alice_log);
     wait_socket(&socket_of(&bob_db), &bob_log);
     wait_connected(&alice_cfg, &alice_db, &alice_log);
@@ -106,8 +105,33 @@ async fn cli_two_of_two_signs_an_ed25519_message() {
         &["create-group", "treasury", "2", &alice_name, &bob_name],
     );
     let group_id = group.id.to_string();
-    let api_token = group.api_token.clone().expect("создатель видит токен API");
+    assert!(group.api_token.is_some(), "создатель видит токен API");
     assert_eq!(group.members.len(), 2);
+    let early = Command::new(env!("CARGO_BIN_EXE_ai-signing-cli"))
+        .arg("--config")
+        .arg(&alice_cfg)
+        .arg("--database")
+        .arg(&eve_db)
+        .args(["request-sign", &group_id, "too-soon"])
+        .output()
+        .expect("ранний запрос");
+    assert!(
+        !early.status.success(),
+        "неготовая группа не принимает сообщение: {}",
+        String::from_utf8_lossy(&early.stderr)
+    );
+    let early_err = String::from_utf8_lossy(&early.stderr);
+    assert!(
+        early_err.contains("группа ещё не готова подписывать"),
+        "stderr: {early_err}"
+    );
+    wait_group(&alice_cfg, &alice_db, &group_id, &alice_log, |group| {
+        group.members.len() == 2
+            && group
+                .members
+                .iter()
+                .all(|member| member.box_public_hex.is_some())
+    });
     let _: GroupDto = cli(&alice_cfg, &eve_db, &["start-dkg", &group_id]);
 
     let active = wait_group(&alice_cfg, &alice_db, &group_id, &alice_log, |group| {
@@ -118,32 +142,64 @@ async fn cli_two_of_two_signs_an_ed25519_message() {
         .clone()
         .expect("у активной группы есть ключ проверки");
 
-    let http = reqwest::Client::new();
-    let created: serde_json::Value = http
-        .post(format!("{base}/api/v1/groups/{group_id}/requests"))
-        .bearer_auth(&api_token)
-        .json(&json!({"message_utf8": "invoice-42"}))
-        .send()
-        .await
-        .expect("запрос на подпись")
-        .error_for_status()
-        .expect("создание запроса")
-        .json()
-        .await
-        .expect("ответ запроса");
-    let request_id = created["request_id"]
-        .as_str()
-        .expect("request_id")
-        .to_string();
+    let denied_sign = Command::new(env!("CARGO_BIN_EXE_ai-signing-cli"))
+        .arg("--config")
+        .arg(&alice_cfg)
+        .arg("--database")
+        .arg(&alice_db)
+        .args(["request-sign", &group_id, "invoice-42"])
+        .output()
+        .expect("запрос подписанта");
+    assert!(
+        !denied_sign.status.success(),
+        "подписант не отправляет сообщение: {}",
+        String::from_utf8_lossy(&denied_sign.stderr)
+    );
+    let denied_sign_err = String::from_utf8_lossy(&denied_sign.stderr);
+    assert!(
+        denied_sign_err.contains("запрос на подпись создаёт администратор"),
+        "stderr: {denied_sign_err}"
+    );
+
+    let created: SignRequestDto = cli(
+        &alice_cfg,
+        &eve_db,
+        &["request-sign", &group_id, "invoice-42"],
+    );
+    assert_eq!(created.status, "pending");
+    assert_eq!(created.message_preview, "invoice-42");
+    let request_id = created.id.to_string();
+    let admin_inbox: Vec<SignRequestDto> = cli(&alice_cfg, &eve_db, &["inbox"]);
+    assert!(
+        admin_inbox.iter().any(|request| request.id == created.id),
+        "админ видит свой запрос: {admin_inbox:?}"
+    );
 
     let _: SignRequestDto = cli(&alice_cfg, &alice_db, &["approve", &request_id]);
     let _: SignRequestDto = cli(&bob_cfg, &bob_db, &["approve", &request_id]);
 
     let signed = wait_inbox(&alice_cfg, &alice_db, &request_id, &alice_log);
-    let signature = signed
+    assert_eq!(signed.status, "completed");
+    assert_eq!(signed.message_preview, "invoice-42");
+    assert!(
+        signed.signature_hex.is_none(),
+        "подписант не видит подпись: {signed:?}"
+    );
+    let bob_done: Vec<SignRequestDto> = cli(&bob_cfg, &bob_db, &["inbox"]);
+    let bob_signed = bob_done
+        .iter()
+        .find(|request| request.id == created.id)
+        .expect("подписант видит своё сообщение");
+    assert!(bob_signed.signature_hex.is_none());
+    let admin_done: Vec<SignRequestDto> = cli(&alice_cfg, &eve_db, &["inbox"]);
+    let admin_signed = admin_done
+        .iter()
+        .find(|request| request.id == created.id)
+        .expect("админ видит готовый запрос");
+    let signature = admin_signed
         .signature_hex
         .clone()
-        .expect("у готового запроса есть подпись");
+        .expect("админ видит подпись");
     verify_ed25519(&verifying_key, b"invoice-42", &signature).expect("подпись Ed25519");
 
     drop(alice_watch);
@@ -194,14 +250,14 @@ fn cli<T: serde::de::DeserializeOwned>(config: &Path, database: &Path, args: &[&
         .unwrap_or_else(|err| panic!("ответ не json ({err})\nstdout: {stdout}\nstderr: {stderr}"))
 }
 
-fn spawn_watch(config: &Path, database: &Path, log: &Path) -> Child {
+fn spawn_watch(config: &Path, database: &Path, log: &Path, password: &str) -> Child {
     let file = std::fs::File::create(log).expect("лог watch");
     Command::new(env!("CARGO_BIN_EXE_ai-signing-cli"))
         .arg("--config")
         .arg(config)
         .arg("--database")
         .arg(database)
-        .arg("watch")
+        .args(["watch", password])
         .stdout(Stdio::null())
         .stderr(Stdio::from(file))
         .spawn()
@@ -275,7 +331,7 @@ fn wait_inbox(config: &Path, database: &Path, request_id: &str, log: &Path) -> S
             if request.status == "failed" {
                 panic!("подпись не удалась: {request:?}\n{}", read_log(log));
             }
-            if request.signature_hex.is_some() {
+            if request.status == "completed" {
                 return request;
             }
             last = format!("{request:?}");
