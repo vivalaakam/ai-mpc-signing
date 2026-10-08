@@ -1,0 +1,43 @@
+services:
+  solana:
+    image: ${SOLANA_IMAGE:-ghcr.io/beeman/solana-test-validator:latest}
+    entrypoint: ["solana-test-validator"]
+    command:
+      - --ledger
+      - /data/ledger
+      - --rpc-port
+      - "8899"
+    ports:
+      - "127.0.0.1:8899:8899"
+      - "127.0.0.1:8900:8900"
+    volumes:
+      - ./data/solana:/data
+    security_opt:
+      - seccomp:./docker/seccomp-validator.json
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  ethereum:
+    image: ${ETHEREUM_IMAGE:-ethereum/client-go:stable}
+    entrypoint: ["geth"]
+    command:
+      - --dev
+      - --datadir=/data
+      - --http
+      - --http.addr=0.0.0.0
+      - --http.port=8545
+      - --http.vhosts=localhost,127.0.0.1,ethereum
+      - --http.corsdomain=*
+      - --http.api=eth,net,web3,debug,txpool
+      - --ws
+      - --ws.addr=0.0.0.0
+      - --ws.port=8546
+      - --ws.api=eth,net,web3
+      - --ws.origins=*
+    ports:
+      - "127.0.0.1:8545:8545"
+      - "127.0.0.1:8546:8546"
+    volumes:
+      - ./data/ethereum:/data
+    restart: unless-stopped
+    stop_grace_period: 30s
