@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "ai-signing-admin"
 path = "src/admin.rs"
 
+[[bin]]
+name = "ai-signing-auto"
+path = "src/auto.rs"
+
 [dependencies]
 ai-signing-client = { path = "../client" }
 ai-signing-protocol = { path = "../protocol" }

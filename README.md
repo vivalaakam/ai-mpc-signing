@@ -37,9 +37,12 @@ cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml c
 cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml create-user alice password1 подписант
 cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml users
 cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml delete-user alice
+cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml issue-cert alice /tmp/alice.cert.json
 ```
 
 Роль указывается при создании: `админ` или `подписант`. Группу создаёт администратор. Подписант входит в клиент и участвует в подписи. `delete-user` удаляет учётную запись и группы, которые этот пользователь создал. Из остальных групп он исключается.
+
+`issue-cert` выпускает сертификат для уже созданного пользователя. Файл содержит секрет. Им можно войти без имени и пароля: так запускается автоподписант. Пароль этой учётной записи по-прежнему открывает окно и командную строку на их собственной базе. Без пути сертификат печатается в вывод.
 
 ## Окно
 
@@ -61,7 +64,7 @@ cargo run --bin ai-signing-cli -- --config /tmp/alice.toml --database /tmp/alice
 
 Активный подписант — это пользователь с ролью подписанта, который уже входил в клиент и у которого есть ключ устройства. Список таких подписантов запрашивает вошедший администратор.
 
-Остальные команды, пока открыты интерфейс, окно или `watch` с той же базой, передаются этому процессу. На время генерации ключа и подписи у каждого подписанта должен быть открыт клиент.
+Остальные команды, пока открыты интерфейс, окно, `watch` или автоподписант с той же базой, передаются этому процессу. На время генерации ключа и подписи у каждого подписанта должен быть открыт клиент.
 
 ```bash
 cargo run --bin ai-signing-cli -- --config /tmp/alice.toml --database /tmp/alice.sqlite login alice password1
@@ -77,6 +80,16 @@ cargo run --bin ai-signing-cli -- --config /tmp/alice.toml --database /tmp/alice
 AI_SIGNING_HOME=/tmp/alice cargo run --bin ai-signing-cli -- watch password1
 AI_SIGNING_HOME=/tmp/bob cargo run --bin ai-signing-cli -- watch password1
 ```
+
+## Автоподписант
+
+Отдельный процесс. Он слушает тот же сокет, что окно и командная строка, и сам подтверждает каждый запрос, в котором участвует. База задаётся флагом `--database`. Вход — сертификат администратора, без имени и пароля. Сертификат же открывает локальные ключи этой базы, поэтому базе автоподписанта не подходит пароль от окна.
+
+```bash
+cargo run -p ai-signing-cli --bin ai-signing-auto -- --config /tmp/alice.toml --database /tmp/alice-auto.sqlite --certificate /tmp/alice.cert.json
+```
+
+Пока процесс запущен, команды `ai-signing-cli` с той же базой передаются ему.
 
 ## Перевод Solana
 

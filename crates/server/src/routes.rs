@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 
 use ai_signing_protocol::{
-    canonical_role, decode_sign_message, AddMemberRequest, AuthResponse, CreateGroupRequest,
-    CreateSignBody, CreateSolanaTransferBody, DeviceKeyRequest, GroupDto, SignRequestDto,
-    SignStatusResponse, SignerDto, UserProfile, ROLE_ADMIN, ROLE_SIGNER,
+    canonical_public_key, canonical_role, decode_sign_message, verify_certificate_login,
+    AddMemberRequest, AuthResponse, CertificateLogin, CreateGroupRequest, CreateSignBody,
+    CreateSolanaTransferBody, DeviceKeyRequest, GroupDto, SignRequestDto, SignStatusResponse,
+    SignerDto, UserProfile, ROLE_ADMIN, ROLE_SIGNER,
 };
 use argon2::{
     password_hash::{rand_core::OsRng, SaltString},
@@ -30,7 +31,12 @@ pub fn router(state: AppState) -> Router {
         .route("/health", get(health))
         .route("/api/users", get(list_users).post(create_user))
         .route("/api/users/{username}", delete(delete_user))
+        .route(
+            "/api/users/{username}/certificates",
+            post(issue_certificate),
+        )
         .route("/api/login", post(login))
+        .route("/api/login/certificate", post(login_certificate))
         .route("/api/me", get(me))
         .route("/api/signers", get(list_signers))
         .route("/api/me/device", put(set_device))
@@ -262,6 +268,140 @@ async fn insert_user(
         return Err(ApiError::db(err));
     }
     Ok(id)
+}
+
+#[derive(Deserialize)]
+struct NewCertificate {
+    public_key_hex: String,
+}
+
+#[derive(Serialize)]
+struct CertificateCreated {
+    certificate_id: Uuid,
+    username: String,
+    public_key_hex: String,
+}
+
+async fn issue_certificate(
+    State(state): State<AppState>,
+    Path(username): Path<String>,
+    Json(body): Json<NewCertificate>,
+) -> Result<(StatusCode, Json<CertificateCreated>), ApiError> {
+    let public_key =
+        canonical_public_key(&body.public_key_hex).map_err(|err| bad(err.to_string()))?;
+    let user: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT id, username FROM users WHERE username = $1")
+            .bind(&username)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::db)?;
+    let Some((user_id, username)) = user else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "пользователь не найден",
+        ));
+    };
+    let certificate_id = Uuid::new_v4();
+    let inserted =
+        sqlx::query("INSERT INTO user_certificates (id, user_id, public_key) VALUES ($1, $2, $3)")
+            .bind(certificate_id)
+            .bind(user_id)
+            .bind(&public_key)
+            .execute(&state.pool)
+            .await;
+    if let Err(err) = inserted {
+        if is_unique(&err) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "такой сертификат уже выпущен",
+            ));
+        }
+        return Err(ApiError::db(err));
+    }
+    Ok((
+        StatusCode::CREATED,
+        Json(CertificateCreated {
+            certificate_id,
+            username,
+            public_key_hex: public_key,
+        }),
+    ))
+}
+
+async fn login_certificate(
+    State(state): State<AppState>,
+    Json(body): Json<CertificateLogin>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    verify_certificate_login(&body)
+        .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "сертификат не принят"))?;
+    let now = chrono::Utc::now().timestamp();
+    if now.abs_diff(body.signed_at) > 120 {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "срок подписи сертификата истёк",
+        ));
+    }
+    if !canonical_nonce(&body.nonce) {
+        return Err(bad("сертификат указан неверно"));
+    }
+    let public_key = canonical_public_key(&body.public_key_hex)
+        .map_err(|_| ApiError::new(StatusCode::UNAUTHORIZED, "сертификат не принят"))?;
+    let row: Option<(Uuid, String, String)> = sqlx::query_as(
+        "SELECT u.id, u.username, u.role
+         FROM user_certificates c
+         JOIN users u ON u.id = c.user_id
+         WHERE c.public_key = $1",
+    )
+    .bind(&public_key)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    let Some((id, username, role)) = row else {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "сертификат не принят",
+        ));
+    };
+    if username != body.username || public_key != body.public_key_hex {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "сертификат не принят",
+        ));
+    }
+    let mut tx = state.pool.begin().await.map_err(ApiError::db)?;
+    sqlx::query("DELETE FROM certificate_nonces WHERE expires_at < now()")
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::db)?;
+    let inserted = sqlx::query(
+        "INSERT INTO certificate_nonces (nonce, expires_at) VALUES ($1, now() + interval '5 minutes')",
+    )
+    .bind(&body.nonce)
+    .execute(&mut *tx)
+    .await;
+    if let Err(err) = inserted {
+        tx.rollback().await.ok();
+        if is_unique(&err) {
+            return Err(ApiError::new(
+                StatusCode::UNAUTHORIZED,
+                "этот вход сертификатом уже использован",
+            ));
+        }
+        return Err(ApiError::db(err));
+    }
+    tx.commit().await.map_err(ApiError::db)?;
+    issue_session(&state, id, username, role).await
+}
+
+fn canonical_nonce(nonce: &str) -> bool {
+    nonce.len() == 32
+        && nonce
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || ('a'..='f').contains(&ch))
+}
+
+fn is_unique(err: &sqlx::Error) -> bool {
+    matches!(err, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }
 
 async fn login(

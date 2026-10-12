@@ -37,6 +37,10 @@ fn main() {
         eprintln!("неизвестный аргумент: {extra}");
         std::process::exit(1);
     }
+    if launch.certificate_path.is_some() {
+        eprintln!("сертификат читает ai-signing-auto. В окне вход по имени и паролю.");
+        std::process::exit(1);
+    }
     let config = match Config::load(&launch.config_path) {
         Ok(config) => config,
         Err(err) => {

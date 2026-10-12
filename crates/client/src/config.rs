@@ -50,6 +50,7 @@ impl Config {
 pub struct Launch {
     pub config_path: PathBuf,
     pub database_path: PathBuf,
+    pub certificate_path: Option<PathBuf>,
     pub rest: Vec<String>,
 }
 
@@ -60,6 +61,7 @@ where
 {
     let mut config = None;
     let mut database = None;
+    let mut certificate = None;
     let mut rest = Vec::new();
     let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
@@ -78,6 +80,13 @@ where
                 .next()
                 .ok_or_else(|| "у --database нет пути".to_string())?;
             set_once(&mut database, "--database", path.as_ref())?;
+        } else if let Some(path) = arg.strip_prefix("--certificate=") {
+            set_once(&mut certificate, "--certificate", path)?;
+        } else if arg == "--certificate" {
+            let path = args
+                .next()
+                .ok_or_else(|| "у --certificate нет пути".to_string())?;
+            set_once(&mut certificate, "--certificate", path.as_ref())?;
         } else if arg == "--help" || arg == "-h" {
             rest.push(arg.to_string());
         } else if arg.starts_with('-') {
@@ -93,6 +102,7 @@ where
         database_path: database
             .map(PathBuf::from)
             .unwrap_or_else(default_database_path),
+        certificate_path: certificate.map(PathBuf::from),
         rest,
     })
 }
@@ -186,6 +196,23 @@ mod tests {
         assert_eq!(launch.rest, vec!["login", "ann"]);
         assert_eq!(launch.config_path, PathBuf::from("/tmp/a.toml"));
         assert_eq!(launch.database_path, PathBuf::from("/tmp/a.sqlite"));
+        assert!(launch.certificate_path.is_none());
+    }
+
+    #[test]
+    fn certificate_flag_is_kept_apart_from_the_command() {
+        let launch = parse_args([
+            "--certificate",
+            "/tmp/bot.json",
+            "--database",
+            "/tmp/bot.sqlite",
+        ])
+        .unwrap();
+        assert!(launch.rest.is_empty());
+        assert_eq!(
+            launch.certificate_path.as_deref(),
+            Some(Path::new("/tmp/bot.json"))
+        );
     }
 
     #[test]

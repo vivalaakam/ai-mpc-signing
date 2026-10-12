@@ -25,6 +25,12 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         include_str!("../migrations/004_solana_transfers.sql"),
     )
     .await?;
+    apply(
+        pool,
+        "005",
+        include_str!("../migrations/005_certificates.sql"),
+    )
+    .await?;
     Ok(())
 }
 

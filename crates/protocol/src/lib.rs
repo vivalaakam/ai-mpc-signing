@@ -5,8 +5,13 @@
 //! ciphertext and, later, aggregate signature shares, which are public inputs
 //! of the FROST coordinator.
 
+mod certificate;
 mod engine;
 
+pub use certificate::{
+    canonical_public_key, verify_certificate_login, CertificateFile, CertificateLogin,
+    CertificateMaterial,
+};
 pub use engine::{
     aggregate_signature, message_preview, message_text, package_verifying_key_hex, recode_hex,
     verify_ed25519, DeviceKey, DkgLocal, HdIdentity, Participant, ParticipantBlobDto,

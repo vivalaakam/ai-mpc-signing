@@ -5,8 +5,8 @@ use std::{
 };
 
 use ai_signing_protocol::{
-    role_title, AuthResponse, ClientMsg, GroupDto, Participant, ServerMsg, SignRequestDto,
-    SignerDto, UserProfile, ROLE_ADMIN,
+    role_title, AuthResponse, CertificateMaterial, ClientMsg, GroupDto, Participant, ServerMsg,
+    SignRequestDto, SignerDto, UserProfile, ROLE_ADMIN,
 };
 use async_channel::Sender;
 use futures::{SinkExt, StreamExt};
@@ -183,12 +183,57 @@ pub fn start(
                     }
                 };
                 let accept = control::accept(listener, accept_tx);
-                let session = run(store, server_url, true, None, false, job_rx, event_tx);
+                let session = run(store, server_url, true, Boot::idle(), job_rx, event_tx);
                 tokio::join!(bridge, accept, session);
             });
         })
         .expect("поток сети");
     (cmd_tx, event_rx)
+}
+
+enum Unlock {
+    Password(String),
+    Certificate(CertificateMaterial),
+}
+
+struct Boot {
+    unlock: Option<Unlock>,
+    resume_session: bool,
+    auto_approve: bool,
+}
+
+impl Boot {
+    fn idle() -> Self {
+        Self {
+            unlock: None,
+            resume_session: false,
+            auto_approve: false,
+        }
+    }
+
+    fn resume() -> Self {
+        Self {
+            unlock: None,
+            resume_session: true,
+            auto_approve: false,
+        }
+    }
+
+    fn password(password: String) -> Self {
+        Self {
+            unlock: Some(Unlock::Password(password)),
+            resume_session: false,
+            auto_approve: false,
+        }
+    }
+
+    fn certificate(certificate: CertificateMaterial) -> Self {
+        Self {
+            unlock: Some(Unlock::Certificate(certificate)),
+            resume_session: false,
+            auto_approve: true,
+        }
+    }
 }
 
 /// Keeps the ceremony running and answers CLI commands on the database socket.
@@ -214,8 +259,7 @@ pub fn watch(
             store,
             server_url,
             true,
-            Some(password.to_string()),
-            false,
+            Boot::password(password.to_string()),
             job_rx,
             event_tx,
         );
@@ -227,6 +271,78 @@ pub fn watch(
             _ = session => {}
             _ = tokio::signal::ctrl_c() => {}
             _ = terminate.recv() => {}
+        }
+        Ok(())
+    })
+}
+
+/// Listens on the database socket, logs in with a certificate, and approves every
+/// pending request this user can sign.
+pub fn auto(
+    store: Store,
+    server_url: String,
+    socket: &Path,
+    certificate: CertificateMaterial,
+) -> Result<(), String> {
+    let listener = control::bind(socket)?;
+    let _unlink = control::Unlink(socket.to_path_buf());
+    eprintln!(
+        "автоподписант слушает {}, сервер {server_url}",
+        socket.display()
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    runtime.block_on(async move {
+        let listener = control::into_tokio(listener)?;
+        let (job_tx, job_rx) = async_channel::unbounded();
+        let (event_tx, event_rx) = async_channel::unbounded();
+        let accept = control::accept(listener, job_tx);
+        let session = run(
+            store,
+            server_url,
+            true,
+            Boot::certificate(certificate),
+            job_rx,
+            event_tx,
+        );
+        tokio::pin!(session);
+        tokio::pin!(accept);
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .map_err(|err| err.to_string())?;
+        let mut ready = false;
+        loop {
+            tokio::select! {
+                _ = &mut session => break,
+                _ = &mut accept => break,
+                state = event_rx.recv() => {
+                    match state {
+                        Ok(state) if !ready => {
+                            ready = true;
+                            if let Some(err) = state.error {
+                                return Err(err);
+                            }
+                            if !state.unlocked || state.username.is_none() {
+                                return Err("сертификат не открыл локальные ключи".into());
+                            }
+                            eprintln!(
+                                "вошёл как {}",
+                                state.username.unwrap_or_default()
+                            );
+                        }
+                        Ok(state) => {
+                            if let Some(err) = state.error.as_deref() {
+                                eprintln!("{err}");
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => break,
+                _ = terminate.recv() => break,
+            }
         }
         Ok(())
     })
@@ -257,7 +373,7 @@ pub fn execute(
             })
             .await
             .map_err(|_| "сессия не запустилась".to_string())?;
-        let session = run(store, server_url, connect, None, true, job_rx, event_tx);
+        let session = run(store, server_url, connect, Boot::resume(), job_rx, event_tx);
         tokio::pin!(session);
         tokio::select! {
             reply = reply_rx => reply.map_err(|_| "сессия не ответила".to_string()),
@@ -296,14 +412,14 @@ struct Session {
     parties: HashMap<Uuid, Participant>,
     focus_group: Option<GroupDto>,
     focus_request: Option<SignRequestDto>,
+    auto_approve: bool,
 }
 
 async fn run(
     store: Store,
     server_url: String,
     connect: bool,
-    unlock_password: Option<String>,
-    resume_session: bool,
+    boot: Boot,
     cmd_rx: async_channel::Receiver<Job>,
     events: Sender<UiState>,
 ) {
@@ -311,6 +427,8 @@ async fn run(
         .timeout(Duration::from_secs(20))
         .build()
         .expect("http");
+    let auto_approve = boot.auto_approve;
+    let resume_session = boot.resume_session;
     let role = store.role();
     let remembered = store.session().map(|(_, _, username)| username);
     let mut session = Session {
@@ -328,20 +446,28 @@ async fn run(
         parties: HashMap::new(),
         focus_group: None,
         focus_request: None,
+        auto_approve,
         store,
         http,
         vault: None,
         events,
     };
-    if let Some(password) = unlock_password {
-        match remembered {
-            Some(username) => {
-                if let Err(err) = session.auth("/api/login", &username, &password).await {
+    if let Some(unlock) = boot.unlock {
+        match unlock {
+            Unlock::Password(password) => match remembered {
+                Some(username) => {
+                    if let Err(err) = session.auth("/api/login", &username, &password).await {
+                        session.error = Some(err.text());
+                    }
+                }
+                None => {
+                    session.error = Some("сначала войдите: login ИМЯ ПАРОЛЬ".into());
+                }
+            },
+            Unlock::Certificate(certificate) => {
+                if let Err(err) = session.auth_certificate(&certificate).await {
                     session.error = Some(err.text());
                 }
-            }
-            None => {
-                session.error = Some("сначала войдите: login ИМЯ ПАРОЛЬ".into());
             }
         }
     } else if resume_session {
@@ -776,6 +902,33 @@ impl Session {
                     .json(&serde_json::json!({ "username": username, "password": password })),
             )
             .await?;
+        self.finish_auth(auth, password, false).await
+    }
+
+    async fn auth_certificate(
+        &mut self,
+        certificate: &CertificateMaterial,
+    ) -> Result<(), CallError> {
+        let proof = certificate
+            .login_now()
+            .map_err(|err| CallError::Message(err.to_string()))?;
+        let auth: AuthResponse = self
+            .send(
+                self.http
+                    .post(self.url("/api/login/certificate"))
+                    .json(&proof),
+            )
+            .await?;
+        self.finish_auth(auth, &certificate.secret_key_hex, true)
+            .await
+    }
+
+    async fn finish_auth(
+        &mut self,
+        auth: AuthResponse,
+        vault_secret: &str,
+        from_certificate: bool,
+    ) -> Result<(), CallError> {
         self.store
             .save_session(&auth.token, auth.user_id, &auth.username, &auth.role)
             .map_err(CallError::Message)?;
@@ -786,9 +939,17 @@ impl Session {
         self.parties.clear();
         self.groups.clear();
         self.requests.clear();
-        match Vault::unlock_or_create(&self.store, password) {
+        match Vault::unlock_or_create(&self.store, vault_secret) {
             Ok(vault) => self.vault = Some(vault),
-            Err(err) => return Err(CallError::Message(err)),
+            Err(err) => {
+                let err = if from_certificate && err == "пароль не открывает локальные ключи"
+                {
+                    "сертификат не открывает локальные ключи этой базы".to_string()
+                } else {
+                    err
+                };
+                return Err(CallError::Message(err));
+            }
         }
         self.upload_account_key().await?;
         self.fetch_lists().await?;
@@ -828,6 +989,40 @@ impl Session {
         } else {
             "Запрос отклонён".into()
         });
+        Ok(())
+    }
+
+    fn can_sign(&self, request: &SignRequestDto) -> bool {
+        request.status == "pending"
+            && request.my_decision.is_none()
+            && self
+                .groups
+                .iter()
+                .any(|group| group.id == request.group_id && group.my_identifier.is_some())
+    }
+
+    async fn approve_pending(&mut self) -> Result<(), CallError> {
+        if !self.auto_approve || !self.connected || self.vault.is_none() {
+            return Ok(());
+        }
+        let ids: Vec<Uuid> = self
+            .requests
+            .iter()
+            .filter(|request| self.can_sign(request))
+            .map(|request| request.id)
+            .collect();
+        let mut failed = None;
+        for id in ids {
+            if let Err(err) = self.decide(id, true).await {
+                if matches!(err, CallError::Unauthorized) {
+                    return Err(err);
+                }
+                failed = Some(err);
+            }
+        }
+        if let Some(err) = failed {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -914,6 +1109,7 @@ impl Session {
         for group in groups {
             self.adopt_group(group);
         }
+        self.approve_pending().await?;
         Ok(())
     }
 
@@ -1056,6 +1252,12 @@ impl Session {
             }
         }
         self.send_client(outgoing, produced);
+        if matches!(
+            &message,
+            ServerMsg::Snapshot { .. } | ServerMsg::SignRequest { .. }
+        ) {
+            self.approve_pending().await.map_err(|err| err.text())?;
+        }
         self.emit();
         Ok(())
     }

@@ -3,6 +3,7 @@
 //! The desktop window and the CLI both use this crate. One process per database
 //! owns the ceremony and a unix socket. Other commands talk to that process.
 
+mod certificate;
 mod config;
 mod control;
 mod session;
@@ -12,11 +13,12 @@ mod vault;
 pub use ai_signing_protocol::{
     message_text, recode_hex, role_title, GroupDto, SignRequestDto, SignerDto,
 };
+pub use certificate::{load_certificate, save_certificate};
 pub use config::{
     default_config_path, default_database_path, parse_args, socket_path_for, Config, Launch,
 };
 pub use control::{try_forward, Unlink};
-pub use session::{execute, start, watch, Cmd, Reply, SettleWait, UiState};
+pub use session::{auto, execute, start, watch, Cmd, Reply, SettleWait, UiState};
 pub use store::Store;
 
 pub fn listen(
