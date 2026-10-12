@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use ai_signing_protocol::{verify_ed25519, CertificateMaterial, GroupDto, SignRequestDto};
 use serde_json::json;
+use tracing::info;
 use uuid::Uuid;
 
 const SOLANA_RPC: &str = "http://127.0.0.1:8899";
@@ -13,7 +14,7 @@ const LAMPORTS: u64 = 1_000_000;
 const AIRDROP: u64 = 1_000_000_000;
 
 fn progress(message: impl std::fmt::Display) {
-    eprintln!("solana_e2e: {message}");
+    info!("solana_e2e: {message}");
 }
 
 struct Proc(Child);
@@ -65,15 +66,16 @@ async fn three_auto_signers_send_a_solana_transfer() {
     std::fs::create_dir_all(&root).unwrap();
     let config = root.join("config.toml");
     std::fs::write(&config, format!("server = \"{base}\"\n")).unwrap();
-    let admin_db = root.join("admin.sqlite");
+    let admin_db_addr = format!("data/admin_{suffix}.sqlite");
+    let admin_db = root.join(admin_db_addr);
     let signers: Vec<Signer> = names
         .iter()
         .enumerate()
         .map(|(index, name)| Signer {
             name: name.clone(),
-            db: root.join(format!("{index}.sqlite")),
-            cert: root.join(format!("{index}.cert.json")),
-            log: root.join(format!("{index}.log")),
+            db: root.join(format!("data/{index}_{suffix}.sqlite")),
+            cert: root.join(format!("data/{index}_{suffix}.cert.json")),
+            log: root.join(format!("data/{index}_{suffix}.log")),
         })
         .collect();
 

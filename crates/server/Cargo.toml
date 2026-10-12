@@ -22,6 +22,6 @@ serde_json = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "derive"] }
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 uuid = { version = "1", features = ["v4", "serde"] }
