@@ -6,6 +6,16 @@ members = [
     "crates/client",
     "crates/cli",
     "crates/desktop",
+    "crates/e2e",
+]
+
+# Сквозные тесты не входят в обычные `cargo build` и `cargo test`.
+default-members = [
+    "crates/protocol",
+    "crates/server",
+    "crates/client",
+    "crates/cli",
+    "crates/desktop",
 ]
 
 [workspace.package]

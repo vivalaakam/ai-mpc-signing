@@ -64,7 +64,7 @@ async fn admin_creates_a_user_who_can_log_in() {
         .as_str()
         .is_some_and(|token| !token.is_empty()));
 
-    let duplicate = Command::new(env!("CARGO_BIN_EXE_ai-signing-admin"))
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_ai-signing-admin-e2e"))
         .arg("--config")
         .arg(&config)
         .args(["create-user", &name, password, "подписант"])
@@ -173,7 +173,7 @@ async fn admin_creates_a_user_who_can_log_in() {
         .expect("повторный вход");
     assert_eq!(login_again.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    let missing = Command::new(env!("CARGO_BIN_EXE_ai-signing-admin"))
+    let missing = Command::new(env!("CARGO_BIN_EXE_ai-signing-admin-e2e"))
         .arg("--config")
         .arg(&config)
         .args(["delete-user", &name])
@@ -193,7 +193,7 @@ async fn admin_creates_a_user_who_can_log_in() {
 }
 
 fn admin(config: &Path, args: &[&str]) -> serde_json::Value {
-    let output = Command::new(env!("CARGO_BIN_EXE_ai-signing-admin"))
+    let output = Command::new(env!("CARGO_BIN_EXE_ai-signing-admin-e2e"))
         .arg("--config")
         .arg(config)
         .args(args)

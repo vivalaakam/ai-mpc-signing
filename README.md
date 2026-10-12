@@ -101,7 +101,13 @@ cargo run --bin ai-signing-cli -- --config /tmp/eve.toml --database /tmp/eve.sql
 
 В окне то же действие есть на карточке активной группы: поля получателя и суммы. Подписанты видят параметры перевода и подтверждают их. После кворума сервер собирает FROST-подпись в настоящую Solana-транзакцию и отправляет её в локальный RPC. Сигнатура сети доступна в `transaction.transaction_signature` ответа `inbox`.
 
-По умолчанию сервер использует `http://127.0.0.1:8899`; другой RPC задаётся переменной `SOLANA_RPC_URL`.
+По умолчанию сервер использует `http://127.0.0.1:8899`; другой RPC задаётся переменной `SOLANA_RPC_URL`. Валидатор поднимается из `docker-compose.yaml`, сервис `solana`.
+
+Сквозной тест создаёт группу из трёх автоподписантов, подписывает перевод и отправляет его в этот валидатор. Нужны PostgreSQL и Docker.
+
+```bash
+cargo test -p ai-signing-e2e --test solana_e2e
+```
 
 Проверить подпись можно в отдельном окне, без входа в учётную запись:
 
@@ -125,4 +131,12 @@ curl -s -X POST http://127.0.0.1:8080/api/v1/groups/GROUP_ID/requests \
 ```bash
 curl -s http://127.0.0.1:8080/api/v1/groups/GROUP_ID/requests/REQUEST_ID \
   -H "Authorization: Bearer API_TOKEN"
+```
+
+## Тесты
+
+Модульные тесты остаются в пакетах приложений и запускаются обычным `cargo test`. Сквозные тесты — отдельный пакет `ai-signing-e2e`: админ, командная строка, автоподписант, церемония FROST и перевод Solana. Им нужен PostgreSQL; сценарию Solana ещё и Docker.
+
+```bash
+cargo test -p ai-signing-e2e
 ```

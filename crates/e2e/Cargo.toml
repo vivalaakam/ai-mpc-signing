@@ -1,0 +1,47 @@
+[package]
+name = "ai-signing-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+autobins = false
+
+# Те же исходники, что у ai-signing-cli: так `cargo test` выставляет
+# CARGO_BIN_EXE_* без нестабильных artifact-зависимостей. Имена отличаются,
+# чтобы не затирать target/debug/ai-signing-*. Запускать приложения нужно
+# из пакета ai-signing-cli.
+
+[[bin]]
+name = "ai-signing-cli-e2e"
+path = "../cli/src/main.rs"
+test = false
+
+[[bin]]
+name = "ai-signing-admin-e2e"
+path = "../cli/src/admin.rs"
+test = false
+
+[[bin]]
+name = "ai-signing-auto-e2e"
+path = "../cli/src/auto.rs"
+test = false
+
+[dependencies]
+ai-signing-client = { path = "../client" }
+ai-signing-protocol = { path = "../protocol" }
+arboard = "3"
+async-channel = "2"
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde = "1"
+serde_json = "1"
+uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+ai-signing-server = { path = "../server" }
+bs58 = "0.5"
+futures = "0.3"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }
+tokio-tungstenite = "0.26"
+uuid = { version = "1", features = ["v4", "serde"] }

@@ -147,15 +147,12 @@ version = "0.1.0"
 dependencies = [
  "ai-signing-client",
  "ai-signing-protocol",
- "ai-signing-server",
  "arboard",
  "async-channel",
  "ratatui",
  "reqwest",
  "serde",
  "serde_json",
- "sqlx",
- "tokio",
  "uuid",
 ]
 
@@ -193,6 +190,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-signing-e2e"
+version = "0.1.0"
+dependencies = [
+ "ai-signing-client",
+ "ai-signing-protocol",
+ "ai-signing-server",
+ "arboard",
+ "async-channel",
+ "bs58",
+ "futures",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "uuid",
+]
+
+[[package]]
 name = "ai-signing-protocol"
 version = "0.1.0"
 dependencies = [
@@ -222,7 +240,6 @@ dependencies = [
  "base64 0.22.1",
  "bs58",
  "chrono",
- "ed25519-dalek",
  "futures",
  "hex",
  "rand 0.8.8",
@@ -232,7 +249,6 @@ dependencies = [
  "sqlx",
  "thiserror 2.0.21",
  "tokio",
- "tokio-tungstenite 0.26.2",
  "tracing",
  "tracing-subscriber",
  "uuid",
