@@ -905,6 +905,7 @@ mod tests {
             status: "dkg".into(),
             api_token: None,
             verifying_key_hex: None,
+            solana_address: None,
             created_by: creator,
             i_created: identifier == 1,
             my_identifier: Some(identifier),

@@ -1,4 +1,6 @@
-use ai_signing_protocol::{message_preview, GroupDto, MemberDto, SignRequestDto};
+use ai_signing_protocol::{
+    message_preview, GroupDto, MemberDto, SignRequestDto, SolanaTransferDto,
+};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -15,6 +17,12 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         pool,
         "003",
         include_str!("../migrations/003_member_keys.sql"),
+    )
+    .await?;
+    apply(
+        pool,
+        "004",
+        include_str!("../migrations/004_solana_transfers.sql"),
     )
     .await?;
     Ok(())
@@ -103,6 +111,16 @@ pub async fn load_group(
         max_signers: group.max_signers as u16,
         status: group.status,
         api_token: i_created.then_some(group.api_token),
+        solana_address: group
+            .verifying_key_hex
+            .as_deref()
+            .and_then(|key| {
+                hex::decode(key)
+                    .ok()
+                    .filter(|bytes| bytes.len() == 32)
+                    .map(bs58::encode)
+            })
+            .map(|encoder| encoder.into_string()),
         verifying_key_hex: group.verifying_key_hex,
         created_by: group.created_by,
         i_created,
@@ -163,6 +181,9 @@ struct RequestRow {
     my_decision: Option<String>,
     created_at: DateTime<Utc>,
     created_by: Uuid,
+    solana_recipient: Option<String>,
+    solana_lamports: Option<i64>,
+    transaction_signature: Option<String>,
 }
 
 fn request_dto(row: RequestRow, reveal_signature: bool) -> SignRequestDto {
@@ -179,6 +200,14 @@ fn request_dto(row: RequestRow, reveal_signature: bool) -> SignRequestDto {
         threshold: row.threshold as u16,
         my_decision: row.my_decision,
         created_at: row.created_at.to_rfc3339(),
+        transaction: match (row.solana_recipient, row.solana_lamports) {
+            (Some(recipient), Some(lamports)) => Some(SolanaTransferDto {
+                recipient,
+                lamports: lamports as u64,
+                transaction_signature: row.transaction_signature,
+            }),
+            _ => None,
+        },
     }
 }
 
@@ -187,7 +216,7 @@ const REQUEST_SQL: &str = "
            (SELECT count(*) FROM signing_approvals a WHERE a.request_id = r.id AND a.decision = 'approved') AS approvals,
            g.threshold,
            (SELECT decision FROM signing_approvals a WHERE a.request_id = r.id AND a.user_id = $1) AS my_decision,
-           r.created_at, g.created_by
+           r.created_at, g.created_by, r.solana_recipient, r.solana_lamports, r.transaction_signature
     FROM signing_requests r
     JOIN groups g ON g.id = r.group_id
 ";

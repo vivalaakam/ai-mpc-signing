@@ -26,6 +26,7 @@ use crate::db::migrate;
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub hub: Hub,
+    pub solana_rpc_url: String,
 }
 
 pub fn database_url() -> String {
@@ -42,6 +43,8 @@ pub async fn bootstrap() -> anyhow::Result<AppState> {
     Ok(AppState {
         pool,
         hub: Hub::default(),
+        solana_rpc_url: std::env::var("SOLANA_RPC_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8899".to_string()),
     })
 }
 

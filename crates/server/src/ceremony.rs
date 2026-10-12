@@ -2,6 +2,8 @@ use ai_signing_protocol::{
     aggregate_signature, package_verifying_key_hex, ServerMsg, SignRequestDto,
 };
 use axum::http::StatusCode;
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::{
@@ -398,6 +400,168 @@ pub async fn create_request(
         .map_err(ApiError::db)
 }
 
+/// Creates the exact legacy Solana message that the FROST group key signs.
+/// The group's Ed25519 verification key is therefore the fee payer address.
+pub async fn create_solana_transfer(
+    state: &AppState,
+    group_id: Uuid,
+    recipient: String,
+    lamports: u64,
+) -> Result<SignRequestDto, ApiError> {
+    if lamports == 0 {
+        return Err(bad("сумма перевода должна быть больше нуля"));
+    }
+    let status_and_key: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT status, verifying_key_hex FROM groups WHERE id = $1")
+            .bind(group_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(ApiError::db)?;
+    let Some((status, Some(group_key))) = status_and_key else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "группа не найдена или у неё нет ключа",
+        ));
+    };
+    if status != "active" {
+        return Err(bad("группа ещё не готова подписывать"));
+    }
+    let payer = hex::decode(group_key).map_err(|_| bad("некорректный ключ группы"))?;
+    let recipient_bytes = bs58::decode(recipient.trim())
+        .into_vec()
+        .map_err(|_| bad("адрес Solana должен быть base58"))?;
+    if payer.len() != 32 || recipient_bytes.len() != 32 {
+        return Err(bad("адрес Solana должен содержать 32 байта"));
+    }
+    let blockhash = solana_blockhash(&state.solana_rpc_url).await?;
+    let message = solana_transfer_message(&payer, &recipient_bytes, &blockhash, lamports);
+    let request_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO signing_requests (id, group_id, message, status, solana_recipient, solana_lamports)
+         VALUES ($1, $2, $3, 'pending', $4, $5)",
+    )
+    .bind(request_id)
+    .bind(group_id)
+    .bind(&message)
+    .bind(recipient.trim())
+    .bind(i64::try_from(lamports).map_err(|_| bad("сумма слишком велика"))?)
+    .execute(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    publish_request(state, request_id, group_id).await?;
+    db::load_request(&state.pool, request_id, Uuid::nil(), false)
+        .await
+        .map_err(ApiError::db)
+}
+
+async fn solana_blockhash(rpc_url: &str) -> Result<[u8; 32], ApiError> {
+    let value: serde_json::Value = reqwest::Client::new()
+        .post(rpc_url)
+        .json(&json!({"jsonrpc":"2.0","id":1,"method":"getLatestBlockhash","params":[{"commitment":"confirmed"}]}))
+        .send()
+        .await
+        .map_err(|err| bad(format!("Solana RPC недоступен: {err}")))?
+        .json()
+        .await
+        .map_err(|err| bad(format!("Solana RPC вернул некорректный ответ: {err}")))?;
+    let encoded = value
+        .pointer("/result/value/blockhash")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| bad(format!("Solana RPC не вернул blockhash: {value}")))?;
+    let bytes = bs58::decode(encoded)
+        .into_vec()
+        .map_err(|_| bad("Solana RPC вернул некорректный blockhash"))?;
+    bytes
+        .try_into()
+        .map_err(|_| bad("Solana RPC вернул blockhash неверной длины"))
+}
+
+fn shortvec(mut value: usize, out: &mut Vec<u8>) {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if value == 0 {
+            return;
+        }
+    }
+}
+
+fn solana_transfer_message(
+    payer: &[u8],
+    recipient: &[u8],
+    blockhash: &[u8; 32],
+    lamports: u64,
+) -> Vec<u8> {
+    const SYSTEM_PROGRAM: [u8; 32] = [0; 32];
+    let mut out = vec![1, 0, 1]; // one writable signer; system program read-only
+    shortvec(3, &mut out);
+    out.extend_from_slice(payer);
+    out.extend_from_slice(recipient);
+    out.extend_from_slice(&SYSTEM_PROGRAM);
+    out.extend_from_slice(blockhash);
+    shortvec(1, &mut out);
+    out.extend_from_slice(&[2, 2, 0, 1, 12]); // SystemProgram transfer, payer -> recipient
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&lamports.to_le_bytes());
+    out
+}
+
+async fn submit_solana_transfer(
+    state: &AppState,
+    request_id: Uuid,
+    message: &[u8],
+    signature_hex: &str,
+) -> Result<String, ApiError> {
+    let signature = hex::decode(signature_hex).map_err(|_| bad("некорректная подпись Solana"))?;
+    if signature.len() != 64 {
+        return Err(bad("подпись Solana должна содержать 64 байта"));
+    }
+    let mut wire = Vec::with_capacity(1 + signature.len() + message.len());
+    shortvec(1, &mut wire);
+    wire.extend_from_slice(&signature);
+    wire.extend_from_slice(message);
+    let value: serde_json::Value = reqwest::Client::new()
+        .post(&state.solana_rpc_url)
+        .json(&json!({"jsonrpc":"2.0","id":request_id.to_string(),"method":"sendTransaction","params":[B64.encode(wire), {"encoding":"base64","preflightCommitment":"confirmed"}]}))
+        .send().await
+        .map_err(|err| bad(format!("не удалось отправить транзакцию в Solana: {err}")))?
+        .json().await
+        .map_err(|err| bad(format!("Solana RPC вернул некорректный ответ: {err}")))?;
+    if let Some(signature) = value.get("result").and_then(|v| v.as_str()) {
+        return Ok(signature.to_owned());
+    }
+    Err(bad(format!(
+        "Solana отклонила транзакцию: {}",
+        value.get("error").unwrap_or(&value)
+    )))
+}
+
+#[cfg(test)]
+mod solana_tests {
+    use super::solana_transfer_message;
+
+    #[test]
+    fn transfer_message_has_one_signer_and_the_expected_system_instruction() {
+        let payer = [7u8; 32];
+        let recipient = [9u8; 32];
+        let blockhash = [3u8; 32];
+        let message = solana_transfer_message(&payer, &recipient, &blockhash, 42);
+
+        assert_eq!(&message[..4], &[1, 0, 1, 3]);
+        assert_eq!(&message[4..36], payer);
+        assert_eq!(&message[36..68], recipient);
+        assert_eq!(&message[68..100], [0; 32]);
+        assert_eq!(&message[100..132], blockhash);
+        assert_eq!(&message[132..138], &[1, 2, 2, 0, 1, 12]);
+        assert_eq!(&message[138..142], &2u32.to_le_bytes());
+        assert_eq!(&message[142..150], &42u64.to_le_bytes());
+    }
+}
+
 pub async fn decide(
     state: &AppState,
     user: Uuid,
@@ -704,6 +868,41 @@ pub async fn sign_share(
         .collect();
     match aggregate_signature(&message, &commitments, &shares, &pubkey) {
         Ok(signature) => {
+            let is_solana: bool = sqlx::query_scalar(
+                "SELECT solana_recipient IS NOT NULL FROM signing_requests WHERE id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(ApiError::db)?;
+            // The request is still locked, so no other coordinator can submit
+            // this exact, blockhash-bound wire transaction concurrently.
+            if is_solana {
+                // Do not hold a DB transaction across the network call: commit
+                // the signed state only after the RPC accepts it.
+                tx.rollback().await.ok();
+                let tx_signature =
+                    match submit_solana_transfer(state, request_id, &message, &signature).await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            fail_sign(state, request_id, group_id, err.message.clone()).await?;
+                            return Err(err);
+                        }
+                    };
+                sqlx::query(
+                    "UPDATE signing_requests SET status = 'completed', signature_hex = $2, transaction_signature = $3, completed_at = now()
+                     WHERE id = $1 AND status = 'signing'",
+                )
+                .bind(request_id)
+                .bind(&signature)
+                .bind(&tx_signature)
+                .execute(&state.pool)
+                .await
+                .map_err(ApiError::db)?;
+                publish_request(state, request_id, group_id).await?;
+                publish_sign_completed(state, group_id, request_id, &signature).await?;
+                return Ok(());
+            }
             sqlx::query(
                 "UPDATE signing_requests
                  SET status = 'completed', signature_hex = $2, completed_at = now()

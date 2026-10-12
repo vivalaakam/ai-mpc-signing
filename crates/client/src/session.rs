@@ -49,6 +49,11 @@ pub enum Cmd {
         group_id: Uuid,
         message: String,
     },
+    RequestSolanaTransfer {
+        group_id: Uuid,
+        recipient: String,
+        lamports: u64,
+    },
     Approve {
         request_id: Uuid,
     },
@@ -710,6 +715,27 @@ impl Session {
                         self.focus_request = Some(request.clone());
                         self.upsert_request(request);
                         self.notice = Some("Запрос отправлен на подпись".into());
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Cmd::RequestSolanaTransfer {
+                group_id,
+                recipient,
+                lamports,
+            } => {
+                let request: Result<SignRequestDto, CallError> = self
+                    .post(
+                        &format!("/api/groups/{group_id}/solana-transfers"),
+                        &serde_json::json!({ "recipient": recipient, "lamports": lamports }),
+                    )
+                    .await;
+                match request {
+                    Ok(request) => {
+                        self.focus_request = Some(request.clone());
+                        self.upsert_request(request);
+                        self.notice = Some("Перевод Solana отправлен на подтверждение".into());
                         Ok(())
                     }
                     Err(err) => Err(err),

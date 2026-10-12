@@ -24,10 +24,8 @@ const HELP: &str = "\
 Переменная AI_SIGNING_HOME задаёт каталог конфига и базы, когда пути не переданы.
 
 В интерфейсе: Ctrl+Q выйти из учётной записи, Ctrl+W закрыть, u обновить, Tab вкладка,
-j/k выбор. Админ: n новая группа, d генерация ключа, s сообщение на подпись.
-На подписанном сообщении: 1 копировать ключ, 2 подпись, 3 сообщение, f формат hex или base64.
-Подписант: a подписать, r отклонить. В новой группе пробел отмечает подписанта,
-Enter создаёт группу. На экране сообщения Enter отправляет текст.
+j/k выбор. Админ: n новая группа, d генерация ключа. Подписант: a подтвердить,
+r отклонить. В новой группе пробел отмечает подписанта, Enter создаёт группу.
 
 Команды:
   login ИМЯ ПАРОЛЬ                 войти
@@ -39,7 +37,7 @@ Enter создаёт группу. На экране сообщения Enter о
   create-group НАЗВАНИЕ T ИМЯ...   создать группу, 2 ≤ t ≤ n ≤ 16
   add-member ID ИМЯ                добавить участника в недособранную группу
   start-dkg ID                     запустить генерацию ключа
-  request-sign ID СООБЩЕНИЕ...     отправить текст на подпись в активную группу
+  request-solana ID АДРЕС LAMPORTS создать перевод Solana для подтверждения
   inbox                            запросы на подпись
   approve ID                       подтвердить подпись
   reject ID                        отклонить запрос
@@ -120,6 +118,7 @@ enum Kind {
     Decide,
     StartDkg,
     RequestSign,
+    RequestSolana,
 }
 
 fn parse_command(command: &str, args: &[String]) -> Result<(Cmd, Kind), String> {
@@ -211,6 +210,23 @@ fn parse_command(command: &str, args: &[String]) -> Result<(Cmd, Kind), String> 
                 Kind::RequestSign,
             ))
         }
+        "request-solana" => {
+            need(3, "request-solana ID АДРЕС LAMPORTS")?;
+            let lamports = args[2]
+                .parse::<u64>()
+                .map_err(|_| "LAMPORTS должен быть положительным целым числом")?;
+            if lamports == 0 {
+                return Err("LAMPORTS должен быть больше нуля".into());
+            }
+            Ok((
+                Cmd::RequestSolanaTransfer {
+                    group_id: parse_id(&args[0], "группы")?,
+                    recipient: args[1].clone(),
+                    lamports,
+                },
+                Kind::RequestSolana,
+            ))
+        }
         "inbox" => {
             need(0, "inbox")?;
             Ok((Cmd::Refresh, Kind::Inbox))
@@ -275,7 +291,7 @@ fn emit(kind: Kind, reply: Reply) -> Result<(), String> {
         }
         Kind::Inbox => print_json(&reply.requests),
         Kind::Signers => print_json(&reply.signers),
-        Kind::Decide | Kind::RequestSign => {
+        Kind::Decide | Kind::RequestSign | Kind::RequestSolana => {
             let request = reply
                 .request
                 .ok_or_else(|| "сервер не вернул запрос".to_string())?;

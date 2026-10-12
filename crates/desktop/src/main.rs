@@ -100,7 +100,8 @@ struct AppView {
     password: Entity<InputState>,
     group_name: Entity<InputState>,
     threshold: Entity<InputState>,
-    message: Entity<InputState>,
+    solana_recipient: Entity<InputState>,
+    solana_lamports: Entity<InputState>,
     picked: HashSet<String>,
     copy_base64: bool,
 }
@@ -130,7 +131,10 @@ impl AppView {
                 .placeholder("2")
                 .default_value("2")
         });
-        let message = cx.new(|cx| InputState::new(window, cx).placeholder("текст сообщения"));
+        let solana_recipient =
+            cx.new(|cx| InputState::new(window, cx).placeholder("адрес Solana (base58)"));
+        let solana_lamports =
+            cx.new(|cx| InputState::new(window, cx).placeholder("сумма в lamports"));
         cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 if this
@@ -155,7 +159,8 @@ impl AppView {
             password,
             group_name,
             threshold,
-            message,
+            solana_recipient,
+            solana_lamports,
             picked: HashSet::new(),
             copy_base64: false,
         }
@@ -677,6 +682,7 @@ impl AppView {
 
     fn active_block(&mut self, group: &GroupDto, cx: &mut Context<Self>) -> impl IntoElement {
         let key = group.verifying_key_hex.clone().unwrap_or_default();
+        let solana_address = group.solana_address.clone().unwrap_or_default();
         v_flex()
             .gap_2()
             .when(!key.is_empty(), |this| {
@@ -684,6 +690,14 @@ impl AppView {
                     format!("vk-{}", group.id),
                     "Ключ проверки",
                     &key,
+                    cx,
+                ))
+            })
+            .when(!solana_address.is_empty(), |this| {
+                this.child(wallet_address_line(
+                    format!("solana-{}", group.id),
+                    &solana_address,
+                    cx.entity(),
                     cx,
                 ))
             })
@@ -710,32 +724,41 @@ impl AppView {
     fn sign_form(&mut self, group: &GroupDto, cx: &mut Context<Self>) -> impl IntoElement {
         let group_id = group.id;
         let busy = self.busy;
-        let message = self.message.clone();
+        let recipient = self.solana_recipient.clone();
+        let lamports = self.solana_lamports.clone();
         let view = cx.entity();
         v_flex()
             .gap_2()
             .child(labeled(
-                "Сообщение",
-                Input::new(&self.message).id("sign-message"),
+                "Получатель",
+                Input::new(&self.solana_recipient).id("solana-recipient"),
+                cx,
+            ))
+            .child(labeled(
+                "Сумма, lamports",
+                Input::new(&self.solana_lamports).id("solana-lamports"),
                 cx,
             ))
             .child(
                 Button::new("request-sign")
                     .primary()
-                    .label("Отправить на подпись")
+                    .label("Создать перевод Solana")
                     .disabled(busy)
                     .on_click(move |_, _, cx| {
-                        let text = message.read(cx).value().trim().to_string();
+                        let recipient = recipient.read(cx).value().trim().to_string();
+                        let lamports = lamports.read(cx).value().trim().parse::<u64>();
                         view.update(cx, |this, cx| {
-                            if text.is_empty() {
-                                this.state.error = Some("Введите сообщение".into());
+                            if recipient.is_empty() || !matches!(lamports, Ok(value) if value > 0) {
+                                this.state.error =
+                                    Some("Введите адрес и положительную сумму в lamports".into());
                                 cx.notify();
                                 return;
                             }
                             this.send(
-                                Cmd::RequestSign {
+                                Cmd::RequestSolanaTransfer {
                                     group_id,
-                                    message: text,
+                                    recipient,
+                                    lamports: lamports.unwrap_or_default(),
                                 },
                                 cx,
                             );
@@ -746,7 +769,7 @@ impl AppView {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
-                    .child("Подписанты увидят сообщение и подтвердят подпись."),
+                    .child("Подписанты увидят адрес и сумму, затем подтвердят перевод."),
             )
     }
 
@@ -872,7 +895,15 @@ impl AppView {
                             )),
                     ),
             )
-            .child(div().child(request.message_preview.clone()))
+            .child(
+                div().child(
+                    request
+                        .transaction
+                        .as_ref()
+                        .map(|tx| format!("Solana: {} lamports → {}", tx.lamports, tx.recipient))
+                        .unwrap_or_else(|| request.message_preview.clone()),
+                ),
+            )
             .child(
                 div()
                     .text_xs()
@@ -1041,6 +1072,38 @@ fn copy_line(id: String, title: &str, value: &str, cx: &App) -> impl IntoElement
             Clipboard::new(id)
                 .value(value.to_string())
                 .tooltip("Копировать"),
+        )
+}
+
+fn wallet_address_line(
+    id: String,
+    value: &str,
+    view: Entity<AppView>,
+    cx: &App,
+) -> impl IntoElement {
+    let address = value.to_string();
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(
+            div()
+                .text_sm()
+                .text_color(cx.theme().muted_foreground)
+                .child("Адрес кошелька Solana"),
+        )
+        .child(
+            Button::new(id)
+                .ghost()
+                .label(short_hex(&address))
+                .tooltip("Скопировать адрес")
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(address.clone()));
+                    view.update(cx, |this, cx| {
+                        this.state.error = None;
+                        this.state.notice = Some("Адрес кошелька скопирован".into());
+                        cx.notify();
+                    });
+                }),
         )
 }
 

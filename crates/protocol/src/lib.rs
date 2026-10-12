@@ -53,6 +53,7 @@ pub struct GroupDto {
     pub status: String,
     pub api_token: Option<String>,
     pub verifying_key_hex: Option<String>,
+    pub solana_address: Option<String>,
     pub created_by: Uuid,
     pub i_created: bool,
     pub my_identifier: Option<u16>,
@@ -73,6 +74,16 @@ pub struct SignRequestDto {
     pub threshold: u16,
     pub my_decision: Option<String>,
     pub created_at: String,
+    /// Solana transfer details. `None` is retained only for requests created
+    /// by older clients while they are being migrated.
+    pub transaction: Option<SolanaTransferDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SolanaTransferDto {
+    pub recipient: String,
+    pub lamports: u64,
+    pub transaction_signature: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,6 +134,12 @@ pub struct DeviceKeyRequest {
 pub struct CreateSignBody {
     pub message_hex: Option<String>,
     pub message_utf8: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateSolanaTransferBody {
+    pub recipient: String,
+    pub lamports: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

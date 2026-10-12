@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use ai_signing_protocol::{
     canonical_role, decode_sign_message, AddMemberRequest, AuthResponse, CreateGroupRequest,
-    CreateSignBody, DeviceKeyRequest, GroupDto, SignRequestDto, SignStatusResponse, SignerDto,
-    UserProfile, ROLE_ADMIN, ROLE_SIGNER,
+    CreateSignBody, CreateSolanaTransferBody, DeviceKeyRequest, GroupDto, SignRequestDto,
+    SignStatusResponse, SignerDto, UserProfile, ROLE_ADMIN, ROLE_SIGNER,
 };
 use argon2::{
     password_hash::{rand_core::OsRng, SaltString},
@@ -40,6 +40,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/groups/{id}/members", post(add_member))
         .route("/api/groups/{id}/dkg", post(start_dkg))
         .route("/api/groups/{id}/requests", post(create_sign_request))
+        .route(
+            "/api/groups/{id}/solana-transfers",
+            post(create_solana_transfer),
+        )
         .route("/api/inbox", get(inbox))
         .route("/api/signing-requests/{id}/approve", post(approve))
         .route("/api/signing-requests/{id}/reject", post(reject))
@@ -644,6 +648,32 @@ async fn create_sign_request(
     }
     let message = decode_sign_message(&body).map_err(|err| bad(err.to_string()))?;
     let request = ceremony::create_request(&state, id, message).await?;
+    Ok((StatusCode::CREATED, Json(request)))
+}
+
+async fn create_solana_transfer(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateSolanaTransferBody>,
+) -> Result<(StatusCode, Json<SignRequestDto>), ApiError> {
+    if user.role != ROLE_ADMIN {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "перевод создаёт администратор",
+        ));
+    }
+    let group = db::load_group(&state.pool, id, user.id)
+        .await
+        .map_err(ApiError::db)?;
+    if !group.i_created {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "отправлять перевод может создатель группы",
+        ));
+    }
+    let request =
+        ceremony::create_solana_transfer(&state, id, body.recipient, body.lamports).await?;
     Ok((StatusCode::CREATED, Json(request)))
 }
 

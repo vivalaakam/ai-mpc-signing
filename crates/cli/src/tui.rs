@@ -1279,6 +1279,7 @@ mod tests {
             status: "active".into(),
             api_token: None,
             verifying_key_hex,
+            solana_address: None,
             created_by: Uuid::from_u128(7),
             i_created: true,
             my_identifier: None,
@@ -1300,6 +1301,7 @@ mod tests {
             threshold: 2,
             my_decision: None,
             created_at: "2026-10-07".into(),
+            transaction: None,
         }
     }
 }
