@@ -577,6 +577,19 @@ pub fn forming_panel_hint(group: &GroupDto, is_admin: bool) -> String {
         .filter(|m| m.participation_accepted)
         .count();
     let total = group.members.len();
+    if group.status == "resharing" {
+        let pending = group
+            .members
+            .iter()
+            .filter(|m| !m.participation_accepted)
+            .count();
+        if is_admin && group.i_created {
+            return format!(
+                "Идёт пересчёт долей. Новые участники подтверждают участие ({ready}/{total}, ожидают {pending}). Когда все новые подтвердят и будут в сети, протокол стартует сам."
+            );
+        }
+        return "Вас добавили в группу при пересчёте долей. Подтвердите участие, если согласны.".into();
+    }
     if is_admin && group.i_created {
         format!(
             "Администратор создал группу. Подписанты подтверждают участие ({ready}/{total}). Когда все подтвердят и будут в сети, генерация ключа начнётся автоматически."
@@ -587,7 +600,7 @@ pub fn forming_panel_hint(group: &GroupDto, is_admin: bool) -> String {
 }
 
 pub fn needs_my_participation(group: &GroupDto) -> bool {
-    group.status == "forming"
+    matches!(group.status.as_str(), "forming" | "resharing")
         && group.my_identifier.is_some_and(|id| {
             group
                 .members

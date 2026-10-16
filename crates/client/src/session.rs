@@ -861,10 +861,22 @@ impl Session {
                     self.emit();
                     return true;
                 };
-                if group.status != "forming" {
+                if group.status != "forming" && group.status != "resharing" {
                     self.error = Some("Группа уже не принимает подтверждения".into());
                     self.emit();
                     return true;
+                }
+                if group.status == "resharing" {
+                    let accepted = group
+                        .members
+                        .iter()
+                        .find(|member| member.user_id == self.user_id.unwrap_or_default())
+                        .is_some_and(|member| member.participation_accepted);
+                    if accepted {
+                        self.error = Some("Участие уже подтверждено".into());
+                        self.emit();
+                        return true;
+                    }
                 }
                 let public_key = match self.group_public(group_id) {
                     Ok(key) => key,
@@ -974,7 +986,9 @@ impl Session {
                     Ok(group) => {
                         self.focus_group = Some(group.clone());
                         self.adopt_group(group);
-                        self.notice = Some("Пересчёт долей запущен".into());
+                        self.notice = Some(
+                            "Состав группы обновлён. Новые участники должны подтвердить участие — пересчёт стартует автоматически.".into(),
+                        );
                         Ok(())
                     }
                     Err(err) => Err(err),
@@ -1180,7 +1194,7 @@ impl Session {
         if group.my_identifier.is_none() || self.vault.is_none() {
             return Ok(());
         }
-        if group.status == "forming" {
+        if group.status == "forming" || group.status == "resharing" {
             let Some(user_id) = self.user_id else {
                 return Ok(());
             };

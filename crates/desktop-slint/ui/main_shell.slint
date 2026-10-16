@@ -1,5 +1,16 @@
-import { Button, TabWidget, VerticalBox, HorizontalBox } from "std-widgets.slint";
-import { GroupRow, SignerRow, MemberRow, FormingMemberRow, RequestRow } from "types.slint";
+import {
+    Button,
+    TabWidget,
+    VerticalBox,
+    HorizontalBox,
+} from "std-widgets.slint";
+import {
+    GroupRow,
+    SignerRow,
+    MemberRow,
+    FormingMemberRow,
+    RequestRow,
+} from "types.slint";
 import { GroupSidebar } from "group_sidebar.slint";
 import { GroupPanel } from "group_tab.slint";
 import { InboxPanel } from "inbox_tab.slint";
@@ -73,107 +84,137 @@ export component MainShell {
         height: 100%;
 
         VerticalBox {
-        padding: 0px;
-        spacing: 0px;
-
-        HorizontalBox {
-            padding: 12px;
-            spacing: 12px;
-            Text { text: "Подпись"; font-weight: 700; }
-            Text { text: root.role-label; color: #666; }
-            Text { text: root.server-url; color: #666; }
-            Text {
-                text: root.connected ? "на связи" : "нет связи";
-                color: root.connected ? #0a0 : #666;
-            }
-            Rectangle { horizontal-stretch: 1; }
-            Button {
-                text: "Обновить";
-                enabled: !root.busy;
-                clicked => { root.refresh-clicked(); }
-            }
-            Button {
-                text: "Выйти";
-                clicked => { root.logout-clicked(); }
-            }
-        }
-
-        HorizontalBox {
-            vertical-stretch: 1;
+            width: 100%;
+            height: 100%;
+            padding: 0px;
             spacing: 0px;
 
-            GroupSidebar {
-                is-admin: root.is-admin;
-                busy: root.busy;
-                show-create-wizard: root.show-create-wizard;
-                groups: root.groups;
-                create-group-clicked => { root.create-group-clicked(); }
-                select-group(id) => { root.select-group(id); }
-            }
-
-            TabWidget {
-                horizontal-stretch: 1;
-                Tab {
-                    title: "Группа";
-                    GroupPanel {
-                        is-admin: root.is-admin;
-                        busy: root.busy;
-                        group-detail-title: root.group-detail-title;
-                        group-detail-body: root.group-detail-body;
-                        group-ceremony-banner: root.group-ceremony-banner;
-                        show-forming-panel: root.show-forming-panel;
-                        forming-panel-hint: root.forming-panel-hint;
-                        forming-members: root.forming-members;
-                        show-accept-participation: root.show-accept-participation;
-                        start-dkg-enabled: root.start-dkg-enabled;
-                        show-membership-editor: root.show-membership-editor;
-                        member-remove-pick: root.member-remove-pick;
-                        member-add-pick: root.member-add-pick;
-                        group-signer-hint: root.group-signer-hint;
-                        show-group-sign-panel: root.show-group-sign-panel;
-                        group-sign-title: root.group-sign-title;
-                        group-sign-body: root.group-sign-body;
-                        group-sign-status: root.group-sign-status;
-                        group-sign-hint: root.group-sign-hint;
-                        group-sign-request-id: root.group-sign-request-id;
-                        group-sign-can-approve: root.group-sign-can-approve;
-                        show-solana-actions: root.show-solana-actions;
-                        solana-recipient <=> root.solana-recipient;
-                        solana-lamports <=> root.solana-lamports;
-                        start-dkg-clicked => { root.start-dkg-clicked(); }
-                        reshare-clicked => { root.reshare-clicked(); }
-                        request-solana-clicked => { root.request-solana-clicked(); }
-                        approve-request(id) => { root.approve-request(id); }
-                        reject-request(id) => { root.reject-request(id); }
-                        toggle-remove-member(u) => { root.toggle-remove-member(u); }
-                        toggle-add-member(u) => { root.toggle-add-member(u); }
-                        accept-participation-clicked => { root.accept-participation-clicked(); }
-                    }
-                }
-                Tab {
-                    title: root.inbox-tab-title;
-                    InboxPanel {
-                        is-admin: root.is-admin;
-                        busy: root.busy;
-                        requests: root.requests;
-                        approve-request(id) => { root.approve-request(id); }
-                        reject-request(id) => { root.reject-request(id); }
-                    }
-                }
-            }
-        }
-
-        if root.status-text != "": Rectangle {
-            background: #f5f5f5;
             HorizontalBox {
-                padding: 8px;
+                padding: 12px;
+                spacing: 12px;
                 Text {
-                    text: root.status-text;
-                    color: root.status-is-error ? #c00 : #060;
-                    wrap: word-wrap;
+                    text: "Подпись";
+                    font-weight: 700;
+                }
+
+                Text {
+                    text: root.role-label;
+                    color: #666;
+                }
+
+                Text {
+                    text: root.server-url;
+                    color: #666;
+                }
+
+                Text {
+                    text: root.connected ? "на связи" : "нет связи";
+                    color: root.connected ? #0a0 : #666;
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+
+                Button {
+                    text: "Обновить";
+                    enabled: !root.busy;
+                    clicked => { root.refresh-clicked(); }
+                }
+
+                Button {
+                    text: "Выйти";
+                    clicked => { root.logout-clicked(); }
                 }
             }
-        }
+
+            HorizontalBox {
+                width: 100%;
+                vertical-stretch: 1;
+                spacing: 0px;
+
+                GroupSidebar {
+                    is-admin: root.is-admin;
+                    busy: root.busy;
+                    show-create-wizard: root.show-create-wizard;
+                    groups: root.groups;
+                    create-group-clicked => { root.create-group-clicked(); }
+                    select-group(id) => { root.select-group(id); }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    min-width: 0;
+                    clip: true;
+                    background: #ffffff;
+
+                    TabWidget {
+                        width: 100%;
+                        height: 100%;
+                        Tab {
+                        title: "Группа";
+                        GroupPanel {
+                            is-admin: root.is-admin;
+                            busy: root.busy;
+                            group-detail-title: root.group-detail-title;
+                            group-detail-body: root.group-detail-body;
+                            group-ceremony-banner: root.group-ceremony-banner;
+                            show-forming-panel: root.show-forming-panel;
+                            forming-panel-hint: root.forming-panel-hint;
+                            forming-members: root.forming-members;
+                            show-accept-participation: root.show-accept-participation;
+                            start-dkg-enabled: root.start-dkg-enabled;
+                            show-membership-editor: root.show-membership-editor;
+                            member-remove-pick: root.member-remove-pick;
+                            member-add-pick: root.member-add-pick;
+                            group-signer-hint: root.group-signer-hint;
+                            show-group-sign-panel: root.show-group-sign-panel;
+                            group-sign-title: root.group-sign-title;
+                            group-sign-body: root.group-sign-body;
+                            group-sign-status: root.group-sign-status;
+                            group-sign-hint: root.group-sign-hint;
+                            group-sign-request-id: root.group-sign-request-id;
+                            group-sign-can-approve: root.group-sign-can-approve;
+                            show-solana-actions: root.show-solana-actions;
+                            solana-recipient <=> root.solana-recipient;
+                            solana-lamports <=> root.solana-lamports;
+                            start-dkg-clicked => { root.start-dkg-clicked(); }
+                            reshare-clicked => { root.reshare-clicked(); }
+                            request-solana-clicked => { root.request-solana-clicked(); }
+                            approve-request(id) => { root.approve-request(id); }
+                            reject-request(id) => { root.reject-request(id); }
+                            toggle-remove-member(u) => { root.toggle-remove-member(u); }
+                            toggle-add-member(u) => { root.toggle-add-member(u); }
+                            accept-participation-clicked => { root.accept-participation-clicked(); }
+                        }
+                    }
+
+                    Tab {
+                        title: root.inbox-tab-title;
+                        InboxPanel {
+                            is-admin: root.is-admin;
+                            busy: root.busy;
+                            requests: root.requests;
+                            approve-request(id) => { root.approve-request(id); }
+                            reject-request(id) => { root.reject-request(id); }
+                        }
+                    }
+                    }
+                }
+            }
+
+            if root.status-text != "": Rectangle {
+                background: #f5f5f5;
+                HorizontalBox {
+                    padding: 8px;
+                    Text {
+                        text: root.status-text;
+                        color: root.status-is-error ? #c00 : #060;
+                        wrap: word-wrap;
+                    }
+                }
+            }
         }
 
         CreateGroupWizard {

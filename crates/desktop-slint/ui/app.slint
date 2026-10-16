@@ -104,6 +104,8 @@ export component AppWindow inherits Window {
         }
 
         if !root.unlocked: LoginPanel {
+            width: 100%;
+            height: 100%;
             server-url: root.server-url;
             login-username <=> root.login-username;
             login-password <=> root.login-password;
@@ -114,6 +116,8 @@ export component AppWindow inherits Window {
         }
 
         if root.unlocked: MainShell {
+            width: 100%;
+            height: 100%;
             role-label: root.role-label;
             server-url: root.server-url;
             connected: root.connected;

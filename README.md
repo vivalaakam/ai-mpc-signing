@@ -141,7 +141,7 @@ Slint: окно администратора и одно окно подписа
 
 ```bash
 cargo test -p ai-signing-e2e --test gui_slint_e2e
-cargo test -p ai-signing-e2e --test slint_group_forming_e2e
+cargo test -p ai-signing-e2e --test slint_group_forming_e2e   # forming, DKG, reshare add/remove, кворум
 ```
 
 Headless JSON-сценарии для этого теста: бинарник `ai-signing-gui-slint-e2e`, код — `crates/e2e/src/slint/` (в основном Slint-клиенте только feature `test-harness` для bootstrap контроллера).

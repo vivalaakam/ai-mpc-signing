@@ -9,9 +9,15 @@ export component InboxPanel {
     callback approve-request(string);
     callback reject-request(string);
 
+    width: 100%;
+    height: 100%;
+
     ScrollView {
+        width: 100%;
+        height: 100%;
         VerticalBox {
             padding: 12px;
+            width: 100%;
             spacing: 8px;
             for req[i] in root.requests: Rectangle {
                 border-width: 1px;

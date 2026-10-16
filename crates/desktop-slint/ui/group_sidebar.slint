@@ -1,7 +1,15 @@
 import { Button, VerticalBox, ScrollView, ListView } from "std-widgets.slint";
 import { GroupRow } from "types.slint";
 
-export component GroupSidebar {
+export component GroupSidebar inherits Rectangle {
+    width: 260px;
+    vertical-stretch: 1;
+    horizontal-stretch: 0;
+    background: #f7f7f8;
+    border-width: 1px;
+    border-color: #ddd;
+    clip: true;
+
     in property <bool> is-admin;
     in property <bool> busy;
     in property <bool> show-create-wizard;
@@ -10,57 +18,52 @@ export component GroupSidebar {
     callback create-group-clicked();
     callback select-group(string);
 
-    Rectangle {
-        width: 260px;
-        background: #f7f7f8;
-        border-width: 1px;
-        border-color: #ddd;
+    VerticalBox {
+        width: 100%;
+        height: 100%;
+        padding: 12px;
+        spacing: 8px;
 
-        VerticalBox {
-            padding: 12px;
-            spacing: 8px;
+        if root.is-admin: Button {
+            text: "Создать группу";
+            enabled: !root.busy && !root.show-create-wizard;
+            clicked => { root.create-group-clicked(); }
+        }
 
-            if root.is-admin: Button {
-                text: "Создать группу";
-                enabled: !root.busy && !root.show-create-wizard;
-                clicked => { root.create-group-clicked(); }
-            }
+        Text {
+            text: "Группы";
+            font-size: 12px;
+            font-weight: 600;
+            color: #666;
+        }
 
-            Text {
-                text: "Группы";
-                font-size: 12px;
-                font-weight: 600;
-                color: #666;
-            }
-
-            ScrollView {
-                vertical-stretch: 1;
-                ListView {
-                    for group[i] in root.groups: Rectangle {
-                        height: 44px;
-                        background: group.selected ? #dce8ff : transparent;
-                        border-radius: 6px;
-                        TouchArea {
-                            clicked => { root.select-group(group.id); }
-                        }
-                        Text {
-                            text: group.label;
-                            color: group.selected ? #003d99 : #222;
-                            overflow: elide;
-                            x: 10px;
-                            y: 12px;
-                            width: parent.width - 20px;
-                        }
+        ScrollView {
+            vertical-stretch: 1;
+            ListView {
+                for group[i] in root.groups: Rectangle {
+                    height: 44px;
+                    background: group.selected ? #dce8ff : transparent;
+                    border-radius: 6px;
+                    TouchArea {
+                        clicked => { root.select-group(group.id); }
+                    }
+                    Text {
+                        text: group.label;
+                        color: group.selected ? #003d99 : #222;
+                        overflow: elide;
+                        x: 10px;
+                        y: 12px;
+                        width: parent.width - 20px;
                     }
                 }
             }
+        }
 
-            if root.groups.length == 0: Text {
-                text: root.is-admin ? "Пока нет групп" : "Администратор добавит вас в группу";
-                color: #888;
-                font-size: 12px;
-                wrap: word-wrap;
-            }
+        if root.groups.length == 0: Text {
+            text: root.is-admin ? "Пока нет групп" : "Администратор добавит вас в группу";
+            color: #888;
+            font-size: 12px;
+            wrap: word-wrap;
         }
     }
 }

@@ -57,10 +57,16 @@ pub fn membership_change(
         .iter()
         .filter(|member| !remove.iter().any(|name| name == &member.username))
         .collect();
+    let final_size = stayers.len() + add.len();
+    if final_size < usize::from(group.threshold) {
+        return Err(
+            "После изменения состава должно остаться не меньше участников, чем порог t".into(),
+        );
+    }
     if stayers.len() < 2 || stayers.len() < usize::from(group.threshold) {
         return Err("После удаления участников порог должен выполняться".into());
     }
-    if stayers.len() + add.len() > usize::from(MAX_SIGNERS) {
+    if final_size > usize::from(MAX_SIGNERS) {
         return Err(format!("В группе не больше {MAX_SIGNERS} участников"));
     }
     for member in &stayers {
@@ -171,7 +177,7 @@ mod tests {
         );
         assert_eq!(
             membership_change(&group, &[], &[], &["alice".into()]).unwrap_err(),
-            "После удаления участников порог должен выполняться"
+            "После изменения состава должно остаться не меньше участников, чем порог t"
         );
         assert_eq!(
             membership_change(&group, &[], &["carol".into()], &[]).unwrap_err(),

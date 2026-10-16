@@ -73,6 +73,11 @@ async fn connected(
         .filter(|group| group.status == "forming")
         .map(|group| group.id)
         .collect();
+    let resharing_group_ids: Vec<Uuid> = groups
+        .iter()
+        .filter(|group| group.status == "resharing")
+        .map(|group| group.id)
+        .collect();
     let hello = ServerMsg::Hello { user_id, username };
     let snap = ServerMsg::Snapshot { groups, requests };
     if send_msg(&mut sink, &hello).await.is_err() || send_msg(&mut sink, &snap).await.is_err() {
@@ -85,6 +90,9 @@ async fn connected(
     }
     for group_id in forming_group_ids {
         ceremony::maybe_auto_start_dkg(&state, group_id).await;
+    }
+    for group_id in resharing_group_ids {
+        crate::reshare::maybe_auto_start_reshare(&state, group_id).await;
     }
 
     loop {

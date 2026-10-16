@@ -416,7 +416,12 @@ pub fn push_to_ui(ui: &AppWindow, controller: &Controller) {
             ui.set_group_sign_can_approve(false);
             ui.set_group_sign_hint(SharedString::from(""));
         }
-        let forming = group.status == "forming";
+        let forming = group.status == "forming"
+            || (group.status == "resharing"
+                && group
+                    .members
+                    .iter()
+                    .any(|member| !member.participation_accepted));
         ui.set_show_forming_panel(forming);
         ui.set_show_start_dkg(false);
         if forming {

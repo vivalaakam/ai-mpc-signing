@@ -545,7 +545,7 @@ async fn set_group_device(
         return Ok(StatusCode::NO_CONTENT);
     }
     let joining = status == "resharing" && current.is_none();
-    if status == "forming" {
+    if status == "forming" || joining {
         let accepted: bool = sqlx::query_scalar(
             "SELECT accepted_at IS NOT NULL FROM group_members WHERE group_id = $1 AND user_id = $2",
         )

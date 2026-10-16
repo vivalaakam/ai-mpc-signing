@@ -119,10 +119,16 @@ pub async fn start(
         .iter()
         .filter(|member| !leaving.contains(&member.0))
         .collect();
+    let final_size = stayers.len() + add.len();
+    if final_size < usize::from(group.threshold) {
+        return Err(bad(
+            "после изменения состава должно остаться не меньше участников, чем порог t",
+        ));
+    }
     if stayers.len() < usize::from(group.threshold) {
         return Err(bad("после удаления участников порог должен выполняться"));
     }
-    if stayers.len() + add.len() > 16 {
+    if final_size > 16 {
         return Err(bad("в группе не больше 16 участников"));
     }
     for member in &stayers {
@@ -145,7 +151,8 @@ pub async fn start(
             return Err(bad("закончились идентификаторы участников"));
         }
         sqlx::query(
-            "INSERT INTO group_members (group_id, user_id, identifier) VALUES ($1, $2, $3)",
+            "INSERT INTO group_members (group_id, user_id, identifier, accepted_at)
+             VALUES ($1, $2, $3, NULL)",
         )
         .bind(group_id)
         .bind(signer)
@@ -200,36 +207,81 @@ pub async fn start(
     }
     tx.commit().await.map_err(ApiError::db)?;
     publish_group(state, group_id).await?;
-    note_device(state, group_id).await
+    maybe_auto_start_reshare(state, group_id).await;
+    Ok(())
 }
 
-pub async fn note_device(state: &AppState, group_id: Uuid) -> Result<(), ApiError> {
-    let ready: bool = sqlx::query_scalar(
+async fn reshare_consents_ready(state: &AppState, group_id: Uuid) -> bool {
+    sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM reshare_sessions WHERE group_id = $1 AND phase = 'waiting')
          AND NOT EXISTS (
             SELECT 1 FROM reshare_roster r
             JOIN group_members gm ON gm.group_id = r.group_id AND gm.user_id = r.user_id
-            WHERE r.group_id = $1 AND gm.box_public IS NULL
+            WHERE r.group_id = $1
+              AND (
+                (r.role = 'joiner' AND (gm.accepted_at IS NULL OR gm.box_public IS NULL))
+                OR (r.role = 'stayer' AND gm.box_public IS NULL)
+              )
          )",
     )
     .bind(group_id)
     .fetch_one(&state.pool)
     .await
-    .map_err(ApiError::db)?;
-    if !ready {
-        return Ok(());
+    .unwrap_or(false)
+}
+
+async fn roster_user_ids(state: &AppState, group_id: Uuid) -> Result<Vec<Uuid>, ApiError> {
+    sqlx::query_scalar("SELECT user_id FROM reshare_roster WHERE group_id = $1 ORDER BY identifier")
+        .bind(group_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(ApiError::db)
+}
+
+pub async fn maybe_auto_start_reshare(state: &AppState, group_id: Uuid) {
+    if !reshare_consents_ready(state, group_id).await {
+        return;
+    }
+    let Ok(roster) = roster_user_ids(state, group_id).await else {
+        return;
+    };
+    if !state.hub.all_online(&roster).await {
+        return;
     }
     let updated = sqlx::query(
         "UPDATE reshare_sessions SET phase = 'refresh' WHERE group_id = $1 AND phase = 'waiting'",
     )
     .bind(group_id)
     .execute(&state.pool)
+    .await;
+    let Ok(result) = updated else {
+        return;
+    };
+    if result.rows_affected() == 1 {
+        tracing::info!(%group_id, "пересчёт долей: фаза refresh");
+        let _ = publish_started(state, group_id).await;
+    }
+}
+
+pub async fn note_device(state: &AppState, group_id: Uuid) -> Result<(), ApiError> {
+    maybe_auto_start_reshare(state, group_id).await;
+    Ok(())
+}
+
+pub async fn is_reshare_joiner(
+    state: &AppState,
+    group_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, ApiError> {
+    let role: Option<String> = sqlx::query_scalar(
+        "SELECT role FROM reshare_roster WHERE group_id = $1 AND user_id = $2",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .fetch_optional(&state.pool)
     .await
     .map_err(ApiError::db)?;
-    if updated.rows_affected() == 1 {
-        publish_started(state, group_id).await?;
-    }
-    Ok(())
+    Ok(role.as_deref() == Some("joiner"))
 }
 
 pub async fn round1(

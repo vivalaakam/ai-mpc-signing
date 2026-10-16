@@ -112,7 +112,16 @@ pub async fn accept_participation(
             "вы не участник этой группы",
         ));
     };
-    if status != "forming" {
+    let resharing_joiner = if status == "resharing" {
+        crate::reshare::is_reshare_joiner(state, group_id, user_id).await?
+    } else {
+        false
+    };
+    if status == "forming" {
+        // ok
+    } else if resharing_joiner {
+        // ok
+    } else {
         return Err(bad("группа уже не принимает подтверждения"));
     }
     if accepted_at.is_some() {
@@ -140,7 +149,11 @@ pub async fn accept_participation(
         .map_err(ApiError::db)?;
     tx.commit().await.map_err(ApiError::db)?;
     publish_group(state, group_id).await?;
-    maybe_auto_start_dkg(state, group_id).await;
+    if status == "forming" {
+        maybe_auto_start_dkg(state, group_id).await;
+    } else {
+        crate::reshare::maybe_auto_start_reshare(state, group_id).await;
+    }
     Ok(())
 }
 
