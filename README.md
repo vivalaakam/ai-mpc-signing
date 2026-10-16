@@ -33,11 +33,11 @@ server = "http://127.0.0.1:8080"
 `ai-signing-admin` создаёт учётную запись на сервере. Адрес берётся из конфига, локальная база не нужна.
 
 ```bash
-cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml create-user eve password1 админ
-cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml create-user alice password1 подписант
-cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml users
-cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml delete-user alice
-cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml issue-cert alice /tmp/alice.cert.json
+cargo run --bin ai-signing-admin -- create-user eve password1 admin
+cargo run --bin ai-signing-admin -- create-user alice password1 signer
+cargo run --bin ai-signing-admin -- users
+cargo run --bin ai-signing-admin -- delete-user alice
+cargo run --bin ai-signing-admin -- issue-cert alice /tmp/alice.cert.json
 ```
 
 Роль указывается при создании: `админ` или `подписант`. Группу создаёт администратор. Подписант входит в клиент и участвует в подписи. `delete-user` удаляет учётную запись и группы, которые этот пользователь создал. Из остальных групп он исключается.
@@ -47,32 +47,43 @@ cargo run -p ai-signing-cli --bin ai-signing-admin -- --config /tmp/alice.toml i
 ## Окно
 
 ```bash
-cargo run -p ai-signing-desktop --bin ai-signing-gui
+cargo run --bin ai-signing-gui -- --database ./data/alice.sqlite
 ```
 
-Войдите под пользователем, которого создал администратор сервера. Пароль нужен при каждом открытии: он проверяется сервером и открывает локальные ключи. Пока окно открыто, оно держит связь с сервером и участвует в протоколе. Администратор создаёт группу и отмечает в ней активных подписантов. Когда группа активна, создатель создаёт перевод SOL. Подписант видит получателя и сумму и подтверждает или отклоняет запрос.
+Войдите под пользователем, которого создал администратор сервера. Пароль нужен при каждом открытии: он проверяется сервером и открывает локальные ключи. Пока окно открыто, оно держит связь с сервером и участвует в протоколе. Администратор создаёт группу и отмечает в ней активных подписантов. Когда группа активна, создатель создаёт перевод SOL. На той же карточке он отмечает, кого убрать и кого добавить, и запускает пересчёт долей. Подписант видит получателя и сумму и подтверждает или отклоняет запрос.
 
 ## Командная строка
 
 Без команды открывается текстовый интерфейс. Он тоже держит связь и участвует в протоколе.
 
 ```bash
-cargo run --bin ai-signing-cli -- --config /tmp/alice.toml --database /tmp/alice.sqlite
+cargo run --bin ai-signing-cli -- --database ./data/alice.sqlite
 ```
 
-`Ctrl+Q` выходит из учётной записи, `Ctrl+W` закрывает интерфейс, `u` обновляет списки. Администратор клавишей `n` создаёт группу: отмечает подписантов пробелом и подтверждает Enter. `d` запускает генерацию ключа. Подписант на вкладке запросов подтверждает перевод клавишей `a` и отклоняет его клавишей `r`.
+`Ctrl+Q` выходит из учётной записи, `Ctrl+W` закрывает интерфейс, `u` обновляет списки. Администратор клавишей `n` создаёт группу: отмечает подписантов пробелом и подтверждает Enter. `d` запускает генерацию ключа. На активной группе, которую он создал, клавиша `m` открывает состав: пробел отмечает, кого убрать или добавить, Enter запускает пересчёт. Подписант на вкладке запросов подтверждает перевод клавишей `a` и отклоняет его клавишей `r`.
 
 Активный подписант — это пользователь с ролью подписанта, который уже входил в клиент и у которого есть ключ устройства. Список таких подписантов запрашивает вошедший администратор.
 
 Остальные команды, пока открыты интерфейс, окно, `watch` или автоподписант с той же базой, передаются этому процессу. На время генерации ключа и подписи у каждого подписанта должен быть открыт клиент.
 
 ```bash
-cargo run --bin ai-signing-cli -- --config /tmp/alice.toml --database /tmp/alice.sqlite login alice password1
-cargo run --bin ai-signing-cli -- --config /tmp/eve.toml --database /tmp/eve.sqlite create-group treasury 2 alice bob
-cargo run --bin ai-signing-cli -- --config /tmp/alice.toml --database /tmp/alice.sqlite watch password1
+cargo run --bin ai-signing-cli -- --database ./data/alice.sqlite login alice password1
+cargo run --bin ai-signing-cli -- --database ./data/eve.sqlite create-group treasury 2 alice bob
+cargo run --bin ai-signing-cli -- --database ./data/alice.sqlite watch password1
 ```
 
-Команды: `login`, `logout`, `whoami`, `groups`, `group`, `signers`, `create-group`, `add-member`, `start-dkg`, `request-solana`, `inbox`, `approve`, `reject`, `watch`, `verify`.
+Команды: `login`, `logout`, `whoami`, `groups`, `group`, `signers`, `create-group`, `add-member`, `start-dkg`, `reshare`, `history`, `request-solana`, `inbox`, `approve`, `reject`, `watch`, `verify`.
+
+Администратор, создавший группу, может пересчитать доли, не меняя адрес Solana. Ушедший участник остаётся со старой долей на своём устройстве: она уже не лежит на новом многочлене. Новая доля того же участника тоже не складывается со старой в ключ группы. Каждая итерация доли остаётся в локальной базе.
+
+```bash
+cargo run --bin ai-signing-cli -- --database ./data/eve.sqlite reshare GROUP_ID remove bob
+cargo run --bin ai-signing-cli -- --database ./data/eve.sqlite reshare GROUP_ID add carol
+cargo run --bin ai-signing-cli -- --database ./data/eve.sqlite reshare GROUP_ID remove bob add carol
+cargo run --bin ai-signing-cli -- --database ./data/eve.sqlite history GROUP_ID
+```
+
+`history` показывает, кого добавили и кого удалили. Пока идёт пересчёт, у каждого оставшегося и нового участника должен быть открыт клиент.
 
 Два клиента на одной машине держат данные отдельно:
 
@@ -86,7 +97,7 @@ AI_SIGNING_HOME=/tmp/bob cargo run --bin ai-signing-cli -- watch password1
 Отдельный процесс. Он слушает тот же сокет, что окно и командная строка, и сам подтверждает каждый запрос, в котором участвует. База задаётся флагом `--database`. Вход — сертификат администратора, без имени и пароля. Сертификат же открывает локальные ключи этой базы, поэтому базе автоподписанта не подходит пароль от окна.
 
 ```bash
-cargo run -p ai-signing-cli --bin ai-signing-auto -- --config /tmp/alice.toml --database /tmp/alice-auto.sqlite --certificate /tmp/alice.cert.json
+cargo run --bin ai-signing-auto -- --database /tmp/alice-auto.sqlite --certificate /tmp/alice.cert.json
 ```
 
 Пока процесс запущен, команды `ai-signing-cli` с той же базой передаются ему.
@@ -96,7 +107,7 @@ cargo run -p ai-signing-cli --bin ai-signing-auto -- --config /tmp/alice.toml --
 Когда группа активна, администратор, который её создал, создаёт перевод. Адрес получателя — base58, сумма указывается в lamports. Ключ группы после DKG является адресом кошелька-отправителя, поэтому его надо пополнить тестовыми SOL до создания перевода.
 
 ```bash
-cargo run --bin ai-signing-cli -- --config /tmp/eve.toml --database /tmp/eve.sqlite request-solana GROUP_ID АДРЕС_ПОЛУЧАТЕЛЯ 1000000
+cargo run --bin ai-signing-cli -- --database ./data/eve.sqlite request-solana GROUP_ID АДРЕС_ПОЛУЧАТЕЛЯ 1000000
 ```
 
 В окне то же действие есть на карточке активной группы: поля получателя и суммы. Подписанты видят параметры перевода и подтверждают их. После кворума сервер собирает FROST-подпись в настоящую Solana-транзакцию и отправляет её в локальный RPC. Сигнатура сети доступна в `transaction.transaction_signature` ответа `inbox`.
@@ -107,6 +118,13 @@ cargo run --bin ai-signing-cli -- --config /tmp/eve.toml --database /tmp/eve.sql
 
 ```bash
 cargo test -p ai-signing-e2e --test solana_e2e
+cargo test -p ai-signing-e2e --test reshare_e2e
+```
+
+Тот же сценарий с обычными подписантами: их поднимает `ai-signing-cli watch`, и каждый подтверждает перевод командой `approve`.
+
+```bash
+cargo test -p ai-signing-e2e --test solana_cli_e2e
 ```
 
 Проверить подпись можно в отдельном окне, без входа в учётную запись:
@@ -135,7 +153,7 @@ curl -s http://127.0.0.1:8080/api/v1/groups/GROUP_ID/requests/REQUEST_ID \
 
 ## Тесты
 
-Модульные тесты остаются в пакетах приложений и запускаются обычным `cargo test`. Сквозные тесты — отдельный пакет `ai-signing-e2e`: админ, командная строка, автоподписант, церемония FROST и перевод Solana. Им нужен PostgreSQL; сценарию Solana ещё и Docker.
+Модульные тесты остаются в пакетах приложений и запускаются обычным `cargo test`. Сквозные тесты — отдельный пакет `ai-signing-e2e`: админ, командная строка, автоподписант, церемония FROST и перевод Solana (автоподписанты и обычные подписанты через `watch`). Им нужен PostgreSQL; сценарию Solana ещё и Docker.
 
 ```bash
 cargo test -p ai-signing-e2e

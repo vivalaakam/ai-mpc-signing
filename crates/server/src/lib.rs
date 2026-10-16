@@ -9,6 +9,7 @@ mod ceremony;
 mod db;
 mod error;
 mod hub;
+mod reshare;
 mod routes;
 mod ws;
 
@@ -35,6 +36,8 @@ pub fn database_url() -> String {
 }
 
 pub async fn bootstrap() -> anyhow::Result<AppState> {
+    // `cargo test` вызывает bootstrap напрямую, минуя `run`, где читается .env.
+    let _ = dotenvy::dotenv();
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&database_url())
@@ -81,6 +84,18 @@ pub async fn delete_user(state: &AppState, username: &str) -> anyhow::Result<()>
         .bind(id)
         .execute(&mut *tx)
         .await?;
+    sqlx::query("DELETE FROM reshare_round2 WHERE to_user_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM reshare_deltas WHERE to_user_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM reshare_roster WHERE user_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM group_members WHERE user_id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -94,6 +109,7 @@ pub async fn delete_user(state: &AppState, username: &str) -> anyhow::Result<()>
 }
 
 pub async fn run() -> anyhow::Result<()> {
+    dotenvy::dotenv().ok();
     init_tracing();
     let bind = std::env::var("BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let addr: SocketAddr = bind.parse()?;

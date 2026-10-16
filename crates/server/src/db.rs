@@ -1,5 +1,5 @@
 use ai_signing_protocol::{
-    message_preview, GroupDto, MemberDto, SignRequestDto, SolanaTransferDto,
+    message_preview, GroupDto, GroupEventDto, MemberDto, SignRequestDto, SolanaTransferDto,
 };
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
@@ -31,6 +31,7 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
         include_str!("../migrations/005_certificates.sql"),
     )
     .await?;
+    apply(pool, "006", include_str!("../migrations/006_reshare.sql")).await?;
     Ok(())
 }
 
@@ -259,6 +260,56 @@ pub async fn list_requests(pool: &PgPool, user: Uuid) -> Result<Vec<SignRequestD
             let reveal = row.created_by == user;
             request_dto(row, reveal)
         })
+        .collect())
+}
+
+pub async fn insert_group_event<'e, E>(
+    executor: E,
+    group_id: Uuid,
+    kind: &str,
+    actor: &str,
+    subject: &str,
+) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query(
+        "INSERT INTO group_events (id, group_id, kind, actor_username, subject_username)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(group_id)
+    .bind(kind)
+    .bind(actor)
+    .bind(subject)
+    .execute(executor)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_group_events(
+    pool: &PgPool,
+    group_id: Uuid,
+) -> Result<Vec<GroupEventDto>, sqlx::Error> {
+    let rows: Vec<(Uuid, Uuid, String, String, String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT id, group_id, kind, actor_username, subject_username, created_at
+         FROM group_events WHERE group_id = $1 ORDER BY created_at, id",
+    )
+    .bind(group_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(id, group_id, kind, actor, subject, created_at)| GroupEventDto {
+                id,
+                group_id,
+                kind,
+                actor,
+                subject,
+                created_at: created_at.to_rfc3339(),
+            },
+        )
         .collect())
 }
 

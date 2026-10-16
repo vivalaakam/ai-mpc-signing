@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use ai_signing_client::{
-    listen, message_text, parse_args, recode_hex, role_title, Cmd, Config, GroupDto,
-    SignRequestDto, Store, UiState,
+    listen, membership_change, message_text, parse_args, recode_hex, role_title, Cmd, Config,
+    GroupDto, GroupEventDto, SignRequestDto, Store, UiState,
 };
 use async_channel::Sender;
 use gpui_kit::component::{
@@ -107,6 +107,8 @@ struct AppView {
     solana_recipient: Entity<InputState>,
     solana_lamports: Entity<InputState>,
     picked: HashSet<String>,
+    remove_picked: HashSet<String>,
+    add_picked: HashSet<String>,
     copy_base64: bool,
 }
 
@@ -166,11 +168,14 @@ impl AppView {
             solana_recipient,
             solana_lamports,
             picked: HashSet::new(),
+            remove_picked: HashSet::new(),
+            add_picked: HashSet::new(),
             copy_base64: false,
         }
     }
 
     fn apply(&mut self, state: UiState) {
+        let previous = self.selected;
         let known: HashSet<Uuid> = self.state.groups.iter().map(|group| group.id).collect();
         let fresh = state
             .groups
@@ -185,6 +190,13 @@ impl AppView {
         }
         if state.notice.as_deref() == Some("Группа создана") {
             self.picked.clear();
+        }
+        if self.selected != previous
+            || state.notice.as_deref() == Some("Пересчёт долей запущен")
+            || !state.unlocked
+        {
+            self.remove_picked.clear();
+            self.add_picked.clear();
         }
         self.state = state;
         self.busy = false;
@@ -576,6 +588,10 @@ impl AppView {
                 }
                 button.on_click(move |_, _, cx| {
                     view.update(cx, |this, cx| {
+                        if this.selected != Some(id) {
+                            this.remove_picked.clear();
+                            this.add_picked.clear();
+                        }
                         this.selected = Some(id);
                         cx.notify();
                     });
@@ -620,9 +636,43 @@ impl AppView {
             .when(group.status == "failed", |this| {
                 this.child("Генерация ключа не удалась. Создайте новую группу.")
             })
+            .when(group.status == "resharing", |this| {
+                this.child("Идёт пересчёт долей. Это окно лучше не закрывать.")
+            })
+            .when(
+                group.i_created
+                    && self
+                        .state
+                        .history
+                        .get(&group.id)
+                        .is_some_and(|events| !events.is_empty()),
+                |panel| panel.child(self.history_block(group, cx)),
+            )
             .when(group.status == "active", |panel| {
                 panel.child(self.active_block(group, cx))
             })
+    }
+
+    fn history_block(&mut self, group: &GroupDto, cx: &mut Context<Self>) -> impl IntoElement {
+        let events = self
+            .state
+            .history
+            .get(&group.id)
+            .cloned()
+            .unwrap_or_default();
+        v_flex()
+            .gap_1()
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("История"),
+            )
+            .children(
+                events
+                    .iter()
+                    .map(|event| div().text_sm().child(event_line(event))),
+            )
     }
 
     fn member_block(
@@ -721,8 +771,204 @@ impl AppView {
                 )
             })
             .when(group.i_created, |this| {
-                this.child(self.sign_form(group, cx))
+                this.child(self.membership_form(group, cx))
+                    .child(self.sign_form(group, cx))
             })
+    }
+
+    fn chosen_membership(&self, group: &GroupDto) -> (Vec<String>, Vec<String>) {
+        let present: HashSet<&str> = group
+            .members
+            .iter()
+            .map(|member| member.username.as_str())
+            .collect();
+        let remove = group
+            .members
+            .iter()
+            .filter(|member| self.remove_picked.contains(&member.username))
+            .map(|member| member.username.clone())
+            .collect();
+        let add = self
+            .state
+            .signers
+            .iter()
+            .filter(|signer| {
+                self.add_picked.contains(&signer.username)
+                    && !present.contains(signer.username.as_str())
+            })
+            .map(|signer| signer.username.clone())
+            .collect();
+        (add, remove)
+    }
+
+    fn membership_form(&mut self, group: &GroupDto, cx: &mut Context<Self>) -> impl IntoElement {
+        let group_id = group.id;
+        let threshold = group.threshold;
+        let busy = self.busy;
+        let view = cx.entity();
+        let members = group.members.clone();
+        let signers = self.state.signers.clone();
+        let present: HashSet<String> = members
+            .iter()
+            .map(|member| member.username.clone())
+            .collect();
+        let (add, remove) = self.chosen_membership(group);
+        let check = membership_change(group, &add, &remove);
+        let staying = members
+            .iter()
+            .filter(|member| !remove.iter().any(|name| name == &member.username))
+            .count();
+        let total = staying + add.len();
+        let mut leave_buttons = Vec::new();
+        for member in &members {
+            let username = member.username.clone();
+            let on = remove.iter().any(|name| name == &username);
+            let mut label = if on {
+                format!("✓ убрать {username} · {}", member.identifier)
+            } else {
+                format!("убрать {username} · {}", member.identifier)
+            };
+            if member.box_public_hex.is_none() {
+                label.push_str(" · нет ключа устройства");
+            }
+            let view = view.clone();
+            let mut button = Button::new(format!("leave-{group_id}-{username}"))
+                .label(label)
+                .w_full();
+            button = if on { button.primary() } else { button.ghost() };
+            leave_buttons.push(
+                button
+                    .on_click(move |_, _, cx| {
+                        let username = username.clone();
+                        view.update(cx, |this, cx| {
+                            this.add_picked.remove(&username);
+                            if !this.remove_picked.insert(username.clone()) {
+                                this.remove_picked.remove(&username);
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+        let mut join_buttons = Vec::new();
+        for signer in signers
+            .iter()
+            .filter(|signer| !present.contains(&signer.username))
+        {
+            let username = signer.username.clone();
+            let on = add.iter().any(|name| name == &username);
+            let label = if on {
+                format!("✓ добавить {username}")
+            } else {
+                format!("добавить {username}")
+            };
+            let view = view.clone();
+            let mut button = Button::new(format!("join-{group_id}-{username}"))
+                .label(label)
+                .w_full();
+            button = if on { button.primary() } else { button.ghost() };
+            join_buttons.push(
+                button
+                    .on_click(move |_, _, cx| {
+                        let username = username.clone();
+                        view.update(cx, |this, cx| {
+                            this.remove_picked.remove(&username);
+                            if !this.add_picked.insert(username.clone()) {
+                                this.add_picked.remove(&username);
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .into_any_element(),
+            );
+        }
+        let hint = if !add.is_empty() || !remove.is_empty() {
+            match &check {
+                Ok(_) => format!("Останется {staying}, всего {total}. Порог {threshold}."),
+                Err(err) => err.clone(),
+            }
+        } else {
+            "Отметьте, кого убрать или добавить.".into()
+        };
+        let hint_color = if check.is_err() && (!add.is_empty() || !remove.is_empty()) {
+            cx.theme().danger
+        } else {
+            cx.theme().muted_foreground
+        };
+        v_flex()
+            .gap_2()
+            .child(div().text_sm().child("Состав группы"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Отметьте, кого убрать и кого добавить. Порог и адрес Solana не меняются. У каждого, кто остаётся, и у нового участника должен быть открыт клиент.",
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Убрать"),
+            )
+            .child(v_flex().gap_1().children(leave_buttons))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Добавить"),
+            )
+            .child(if join_buttons.is_empty() {
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Нет подписантов вне группы. Подписант появляется здесь после входа в клиент.")
+                    .into_any_element()
+            } else {
+                v_flex().gap_1().children(join_buttons).into_any_element()
+            })
+            .child(div().text_sm().text_color(hint_color).child(hint))
+            .child(
+                Button::new(format!("reshare-{group_id}"))
+                    .primary()
+                    .label("Пересчитать доли")
+                    .disabled(busy || check.is_err())
+                    .on_click({
+                        let view = view.clone();
+                        move |_, _, cx| {
+                            view.update(cx, |this, cx| {
+                                let Some(group) = this
+                                    .state
+                                    .groups
+                                    .iter()
+                                    .find(|group| group.id == group_id)
+                                    .cloned()
+                                else {
+                                    this.state.error = Some("Группа не найдена".into());
+                                    cx.notify();
+                                    return;
+                                };
+                                let (add, remove) = this.chosen_membership(&group);
+                                match membership_change(&group, &add, &remove) {
+                                    Ok((add, remove)) => this.send(
+                                        Cmd::Reshare {
+                                            group_id,
+                                            add,
+                                            remove,
+                                        },
+                                        cx,
+                                    ),
+                                    Err(err) => {
+                                        this.state.error = Some(err);
+                                        cx.notify();
+                                    }
+                                }
+                            });
+                        }
+                    }),
+            )
     }
 
     fn sign_form(&mut self, group: &GroupDto, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1296,8 +1542,19 @@ fn group_status(status: &str) -> &str {
         "dkg" => "генерация ключа",
         "active" => "активна",
         "failed" => "ошибка",
+        "resharing" => "пересчёт долей",
         other => other,
     }
+}
+
+fn event_line(event: &GroupEventDto) -> String {
+    let action = match event.kind.as_str() {
+        "member_added" => "добавлен",
+        "member_removed" => "удалён",
+        other => other,
+    };
+    let when = event.created_at.chars().take(19).collect::<String>();
+    format!("{}: {action} {} · {when}", event.actor, event.subject)
 }
 
 fn request_status(status: &str) -> &str {

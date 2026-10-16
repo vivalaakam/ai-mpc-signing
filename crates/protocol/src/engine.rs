@@ -14,7 +14,8 @@ use sha2::Sha512;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
-use crate::{ClientMsg, Error, GroupDto, SealedPackage, ServerMsg};
+use crate::reshare::{ReshareOut, ReshareSession};
+use crate::{ClientMsg, Error, GroupDto, RosterKey, SealedPackage, ServerMsg};
 
 type R1Secret = frost::keys::dkg::round1::SecretPackage;
 type R1Package = frost::keys::dkg::round1::Package;
@@ -176,7 +177,7 @@ fn parse_public(hex_value: &str) -> Result<PublicKey, Error> {
     Ok(PublicKey::from(bytes))
 }
 
-fn ident(value: u16) -> Result<frost::Identifier, Error> {
+pub(crate) fn ident(value: u16) -> Result<frost::Identifier, Error> {
     if value == 0 {
         return Err(Error::msg("идентификатор FROST не может быть 0"));
     }
@@ -184,7 +185,7 @@ fn ident(value: u16) -> Result<frost::Identifier, Error> {
         .map_err(|err| Error::msg(format!("идентификатор FROST: {err}")))
 }
 
-fn ident_to_u16(id: frost::Identifier) -> Result<u16, Error> {
+pub(crate) fn ident_to_u16(id: frost::Identifier) -> Result<u16, Error> {
     let bytes = id.serialize();
     if bytes.len() != 32 || bytes[2..].iter().any(|byte| *byte != 0) {
         return Err(Error::msg("идентификатор FROST вне диапазона u16"));
@@ -192,11 +193,11 @@ fn ident_to_u16(id: frost::Identifier) -> Result<u16, Error> {
     Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
 }
 
-fn to_json<T: Serialize>(value: &T) -> Result<String, Error> {
+pub(crate) fn to_json<T: Serialize>(value: &T) -> Result<String, Error> {
     serde_json::to_string(value).map_err(|err| Error::msg(format!("сериализация: {err}")))
 }
 
-fn from_json<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T, Error> {
+pub(crate) fn from_json<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T, Error> {
     serde_json::from_str(value).map_err(|err| Error::msg(format!("разбор пакета: {err}")))
 }
 
@@ -207,6 +208,23 @@ pub fn package_verifying_key_hex(public_key_package_json: &str) -> Result<String
         .serialize()
         .map_err(|err| Error::msg(format!("ключ проверки: {err}")))?;
     Ok(hex::encode(bytes))
+}
+
+/// Parses a public package and serializes it again, so two honest parties compare equal.
+pub fn canonical_public_package(public_key_package_json: &str) -> Result<String, Error> {
+    let package: PublicKeyPackage = from_json(public_key_package_json)?;
+    to_json(&package)
+}
+
+/// Participant identifiers encoded in a public key package, ascending.
+pub fn package_signer_ids(public_key_package_json: &str) -> Result<Vec<u16>, Error> {
+    let package: PublicKeyPackage = from_json(public_key_package_json)?;
+    let mut ids = Vec::new();
+    for id in package.verifying_shares().keys() {
+        ids.push(ident_to_u16(*id)?);
+    }
+    ids.sort_unstable();
+    Ok(ids)
 }
 
 pub fn aggregate_signature(
@@ -576,6 +594,7 @@ pub struct Participant {
     device: DeviceKey,
     group: GroupDto,
     dkg: Option<DkgLocal>,
+    reshare: Option<ReshareSession>,
     key: Option<KeyPackage>,
     pubkey_json: Option<String>,
     signs: HashMap<Uuid, SignLocal>,
@@ -587,6 +606,7 @@ impl Participant {
             device,
             group,
             dkg: None,
+            reshare: None,
             key: None,
             pubkey_json: None,
             signs: HashMap::new(),
@@ -615,6 +635,11 @@ impl Participant {
     pub fn export(&self) -> Result<ParticipantBlobDto, Error> {
         Ok(ParticipantBlobDto {
             dkg: self.dkg.as_ref().map(|dkg| dkg.export()).transpose()?,
+            reshare: self
+                .reshare
+                .as_ref()
+                .map(|session| session.export())
+                .transpose()?,
             key: self.key.as_ref().map(to_json).transpose()?,
             pubkey: self.pubkey_json.clone(),
             signs: self
@@ -627,6 +652,11 @@ impl Participant {
 
     pub fn import_state(&mut self, state: &ParticipantBlobDto) -> Result<(), Error> {
         self.dkg = state.dkg.as_deref().map(DkgLocal::import).transpose()?;
+        self.reshare = state
+            .reshare
+            .as_deref()
+            .map(ReshareSession::import)
+            .transpose()?;
         self.key = state.key.as_deref().map(from_json).transpose()?;
         self.pubkey_json = state.pubkey.clone();
         self.signs.clear();
@@ -664,8 +694,282 @@ impl Participant {
                 from,
                 commitment,
             } => self.on_commitment(*request_id, *from, commitment),
+            ServerMsg::ReshareStarted {
+                group_id,
+                generation,
+                threshold,
+                stayers,
+                joiners,
+                keys,
+            } if *group_id == self.group.id => {
+                self.on_reshare_started(*generation, *threshold, stayers, joiners, keys)
+            }
+            ServerMsg::ReshareRound1 {
+                group_id,
+                from,
+                package,
+            } if *group_id == self.group.id => self.on_reshare_round1(*from, package),
+            ServerMsg::ReshareRound2 {
+                group_id,
+                from,
+                ciphertext,
+            } if *group_id == self.group.id => self.on_reshare_round2(*from, ciphertext),
+            ServerMsg::ReshareRepair {
+                group_id,
+                public_key_package,
+            } if *group_id == self.group.id => self.on_reshare_repair(public_key_package),
+            ServerMsg::ReshareDelta {
+                group_id,
+                joiner,
+                from,
+                ciphertext,
+            } if *group_id == self.group.id => self.on_reshare_delta(*joiner, *from, ciphertext),
+            ServerMsg::ReshareSigma {
+                group_id,
+                joiner,
+                from,
+                ciphertext,
+                commitment,
+            } if *group_id == self.group.id => {
+                self.on_reshare_sigma(*joiner, *from, ciphertext, commitment)
+            }
+            ServerMsg::ReshareSigmaCommit {
+                group_id,
+                joiner,
+                from,
+                commitment,
+            } if *group_id == self.group.id => self.on_reshare_commit(*joiner, *from, commitment),
+            ServerMsg::ReshareVerifying {
+                group_id,
+                joiner,
+                verifying_share,
+            } if *group_id == self.group.id => self.on_reshare_verifying(*joiner, verifying_share),
+            ServerMsg::ReshareCompleted { group_id, .. } if *group_id == self.group.id => {
+                self.on_reshare_completed()
+            }
+            ServerMsg::ReshareFailed { group_id, .. } if *group_id == self.group.id => {
+                self.reshare = None;
+                Ok(Vec::new())
+            }
             _ => Ok(Vec::new()),
         }
+    }
+
+    fn on_reshare_started(
+        &mut self,
+        generation: u32,
+        threshold: u16,
+        stayers: &[u16],
+        joiners: &[u16],
+        keys: &[RosterKey],
+    ) -> Result<Vec<ClientMsg>, Error> {
+        if self
+            .reshare
+            .as_ref()
+            .is_some_and(|session| session.generation() == generation)
+        {
+            let outs = match self.reshare.as_ref() {
+                Some(session) => session.pending()?,
+                None => Vec::new(),
+            };
+            return self.emit_reshare(outs);
+        }
+        let Some(my_id) = self.group.my_identifier else {
+            return Ok(Vec::new());
+        };
+        if !stayers.contains(&my_id) && !joiners.contains(&my_id) {
+            self.reshare = None;
+            return Ok(Vec::new());
+        }
+        let mut box_keys = BTreeMap::new();
+        for key in keys {
+            box_keys.insert(key.identifier, key.box_public_hex.clone());
+        }
+        let mut session = ReshareSession::new(
+            generation,
+            my_id,
+            threshold,
+            stayers.to_vec(),
+            joiners.to_vec(),
+            box_keys,
+        )?;
+        let old_key = self.key.as_ref().map(to_json).transpose()?;
+        let outs = session.start(old_key.as_deref(), self.pubkey_json.as_deref())?;
+        self.signs.clear();
+        self.reshare = Some(session);
+        self.emit_reshare(outs)
+    }
+
+    fn on_reshare_round1(&mut self, from: u16, package: &str) -> Result<Vec<ClientMsg>, Error> {
+        let Some(session) = self.reshare.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let outs = session.push_round1(from, package)?;
+        self.emit_reshare(outs)
+    }
+
+    fn on_reshare_round2(&mut self, from: u16, ciphertext: &str) -> Result<Vec<ClientMsg>, Error> {
+        let json = self.open_sealed(ciphertext)?;
+        let Some(session) = self.reshare.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let outs = session.push_round2(from, &json)?;
+        self.emit_reshare(outs)
+    }
+
+    fn on_reshare_repair(&mut self, pubkey_json: &str) -> Result<Vec<ClientMsg>, Error> {
+        let Some(session) = self.reshare.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let outs = session.on_repair(pubkey_json)?;
+        self.emit_reshare(outs)
+    }
+
+    fn on_reshare_delta(
+        &mut self,
+        joiner: u16,
+        from: u16,
+        ciphertext: &str,
+    ) -> Result<Vec<ClientMsg>, Error> {
+        let json = self.open_sealed(ciphertext)?;
+        let Some(session) = self.reshare.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let outs = session.push_delta(joiner, from, &json)?;
+        self.emit_reshare(outs)
+    }
+
+    fn on_reshare_sigma(
+        &mut self,
+        joiner: u16,
+        from: u16,
+        ciphertext: &str,
+        commitment: &str,
+    ) -> Result<Vec<ClientMsg>, Error> {
+        let json = self.open_sealed(ciphertext)?;
+        let Some(session) = self.reshare.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let outs = session.push_sigma(joiner, from, &json, commitment)?;
+        self.emit_reshare(outs)
+    }
+
+    fn on_reshare_commit(
+        &mut self,
+        joiner: u16,
+        from: u16,
+        commitment: &str,
+    ) -> Result<Vec<ClientMsg>, Error> {
+        let Some(session) = self.reshare.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let outs = session.push_commitment(joiner, from, commitment)?;
+        self.emit_reshare(outs)
+    }
+
+    fn on_reshare_verifying(
+        &mut self,
+        joiner: u16,
+        verifying_share: &str,
+    ) -> Result<Vec<ClientMsg>, Error> {
+        let Some(session) = self.reshare.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let outs = session.push_verifying(joiner, verifying_share)?;
+        self.emit_reshare(outs)
+    }
+
+    fn on_reshare_completed(&mut self) -> Result<Vec<ClientMsg>, Error> {
+        let Some(session) = self.reshare.as_mut() else {
+            return Ok(Vec::new());
+        };
+        let Some((key_json, pubkey)) = session.finish()? else {
+            return Ok(Vec::new());
+        };
+        self.key = Some(from_json(&key_json)?);
+        self.pubkey_json = Some(pubkey);
+        self.reshare = None;
+        Ok(Vec::new())
+    }
+
+    fn open_sealed(&self, ciphertext: &str) -> Result<String, Error> {
+        let plaintext = self.device.open(ciphertext)?;
+        String::from_utf8(plaintext).map_err(|_| Error::msg("пакет решаринга не является текстом"))
+    }
+
+    fn emit_reshare(&mut self, outs: Vec<ReshareOut>) -> Result<Vec<ClientMsg>, Error> {
+        let mut messages = Vec::new();
+        for out in outs {
+            let message = match out {
+                ReshareOut::Round1(package) => ClientMsg::ReshareRound1 {
+                    group_id: self.group.id,
+                    package,
+                },
+                ReshareOut::Round2(packages) => ClientMsg::ReshareRound2 {
+                    group_id: self.group.id,
+                    packages: self.seal_to(&packages)?,
+                },
+                ReshareOut::RefreshPublic(public_key_package) => ClientMsg::ReshareRefreshPublic {
+                    group_id: self.group.id,
+                    public_key_package,
+                },
+                ReshareOut::Deltas { joiner, packages } => ClientMsg::ReshareDelta {
+                    group_id: self.group.id,
+                    joiner,
+                    packages: self.seal_to(&packages)?,
+                },
+                ReshareOut::Sigma {
+                    joiner,
+                    sigma,
+                    commitment,
+                } => {
+                    let recipient = self.box_of(joiner)?;
+                    ClientMsg::ReshareSigma {
+                        group_id: self.group.id,
+                        joiner,
+                        ciphertext: self.device.seal_to(recipient, sigma.as_bytes())?,
+                        commitment,
+                    }
+                }
+                ReshareOut::Verifying { joiner, share } => ClientMsg::ReshareVerifying {
+                    group_id: self.group.id,
+                    joiner,
+                    verifying_share: share,
+                },
+                ReshareOut::Public(public_key_package) => ClientMsg::ResharePublic {
+                    group_id: self.group.id,
+                    public_key_package,
+                },
+            };
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
+    fn seal_to(&self, packages: &[(u16, String)]) -> Result<Vec<SealedPackage>, Error> {
+        let mut sealed = Vec::new();
+        for (to, json) in packages {
+            let recipient = self.box_of(*to)?;
+            sealed.push(SealedPackage {
+                to: *to,
+                ciphertext: self.device.seal_to(recipient, json.as_bytes())?,
+            });
+        }
+        Ok(sealed)
+    }
+
+    fn box_of(&self, identifier: u16) -> Result<&str, Error> {
+        if let Some(session) = &self.reshare {
+            if let Some(key) = session.box_key(identifier) {
+                return Ok(key);
+            }
+        }
+        self.group
+            .members
+            .iter()
+            .find(|member| member.identifier == identifier)
+            .and_then(|member| member.box_public_hex.as_deref())
+            .ok_or_else(|| Error::msg(format!("нет ключа устройства участника {identifier}")))
     }
 
     fn resend_public(&self) -> Result<Vec<ClientMsg>, Error> {
@@ -840,6 +1144,8 @@ impl Participant {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParticipantBlobDto {
     pub dkg: Option<String>,
+    #[serde(default)]
+    pub reshare: Option<String>,
     pub key: Option<String>,
     pub pubkey: Option<String>,
     pub signs: Vec<(Uuid, String)>,
@@ -1022,7 +1328,7 @@ mod tests {
                 commitment: commitment.clone(),
             },
             ClientMsg::SignShare { .. } | ClientMsg::DkgPublic { .. } => return,
-            other => panic!("unexpected relay {other:?}"),
+            _ => return,
         };
         outgoing.extend(peer.handle(&server).unwrap());
     }

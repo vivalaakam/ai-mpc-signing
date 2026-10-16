@@ -213,6 +213,7 @@ mod tests {
             key: Some("share-secret".into()),
             pubkey: Some("pub".into()),
             signs: vec![],
+            reshare: None,
         };
         store.save_share(user, group, &blob, &vault).unwrap();
         let path = dir.join("client.sqlite");

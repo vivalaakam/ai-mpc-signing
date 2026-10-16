@@ -6,20 +6,24 @@
 mod certificate;
 mod config;
 mod control;
+mod membership;
 mod session;
 mod store;
 mod vault;
 
 pub use ai_signing_protocol::{
-    message_text, recode_hex, role_title, GroupDto, SignRequestDto, SignerDto,
+    message_text, recode_hex, role_title, GroupDto, GroupEventDto, MemberDto, SignRequestDto,
+    SignerDto,
 };
 pub use certificate::{load_certificate, save_certificate};
 pub use config::{
     default_config_path, default_database_path, parse_args, socket_path_for, Config, Launch,
 };
 pub use control::{try_forward, Unlink};
+pub use membership::membership_change;
 pub use session::{auto, execute, start, watch, Cmd, Reply, SettleWait, UiState};
-pub use store::Store;
+pub use store::{ShareEpoch, Store};
+pub use vault::Vault;
 
 pub fn listen(
     database: &std::path::Path,

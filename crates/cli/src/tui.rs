@@ -3,8 +3,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use ai_signing_client::{
-    listen, message_text, recode_hex, role_title, start, Cmd, GroupDto, SignRequestDto, Store,
-    UiState,
+    listen, membership_change, message_text, recode_hex, role_title, start, Cmd, GroupDto,
+    GroupEventDto, SignRequestDto, Store, UiState,
 };
 use async_channel::Sender;
 use ratatui::{
@@ -40,6 +40,7 @@ enum Screen {
     Home,
     Create,
     Message,
+    Members,
 }
 
 struct LoginForm {
@@ -62,12 +63,26 @@ struct MessageForm {
     text: String,
 }
 
+struct MembersForm {
+    group_id: Uuid,
+    index: usize,
+    remove: HashSet<String>,
+    add: HashSet<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum MemberRow {
+    Present(String),
+    Candidate(String),
+}
+
 struct App {
     state: UiState,
     screen: Screen,
     login: LoginForm,
     create: CreateForm,
     message: MessageForm,
+    members: MembersForm,
     tab: u8,
     group_index: usize,
     request_index: usize,
@@ -106,6 +121,12 @@ impl App {
                 group_name: String::new(),
                 text: String::new(),
             },
+            members: MembersForm {
+                group_id: Uuid::nil(),
+                index: 0,
+                remove: HashSet::new(),
+                add: HashSet::new(),
+            },
             tab: 0,
             group_index: 0,
             request_index: 0,
@@ -143,6 +164,7 @@ impl App {
     fn apply(&mut self, state: UiState) {
         let created = state.notice.as_deref() == Some("Группа создана");
         let sent = state.notice.as_deref() == Some("Запрос отправлен на подпись");
+        let reshared = state.notice.as_deref() == Some("Пересчёт долей запущен");
         let unlocked = state.unlocked;
         self.state = state;
         self.pending = false;
@@ -165,6 +187,10 @@ impl App {
         } else if matches!(self.screen, Screen::Message) && sent {
             self.screen = Screen::Home;
             self.message.text.clear();
+        } else if matches!(self.screen, Screen::Members) && reshared {
+            self.screen = Screen::Home;
+            self.members.remove.clear();
+            self.members.add.clear();
         }
         self.clamp();
     }
@@ -173,6 +199,7 @@ impl App {
         self.group_index = clamp_index(self.group_index, self.state.groups.len());
         self.request_index = clamp_index(self.request_index, self.request_order().len());
         self.create.index = clamp_index(self.create.index, self.state.signers.len());
+        self.members.index = clamp_index(self.members.index, self.member_rows().len());
     }
 
     fn on_key(&mut self, key: KeyEvent, commands: &Sender<Cmd>) {
@@ -194,6 +221,7 @@ impl App {
             Screen::Home => self.home_key(key, commands),
             Screen::Create => self.create_key(key, commands),
             Screen::Message => self.message_key(key, commands),
+            Screen::Members => self.members_key(key, commands),
         }
     }
 
@@ -276,6 +304,7 @@ impl App {
                 }
             }
             KeyCode::Char('s') => self.open_message(),
+            KeyCode::Char('m') => self.open_members(commands),
             KeyCode::Char('a') => self.decide(commands, true),
             KeyCode::Char('r') => self.decide(commands, false),
             _ => {}
@@ -352,6 +381,92 @@ impl App {
         self.message.group_name = group_name;
         self.message.text.clear();
         self.screen = Screen::Message;
+    }
+
+    fn open_members(&mut self, commands: &Sender<Cmd>) {
+        if !self.is_admin() {
+            self.local_error = Some("Пересчёт долей запускает администратор".into());
+            return;
+        }
+        let Some((group_id, created, active)) = self
+            .selected_group()
+            .map(|group| (group.id, group.i_created, group.status == "active"))
+        else {
+            self.local_error = Some("Выберите группу".into());
+            return;
+        };
+        if !created {
+            self.local_error = Some("Пересчитывать доли может создатель группы".into());
+            return;
+        }
+        if !active {
+            self.local_error = Some("Пересчёт долей доступен только активной группе".into());
+            return;
+        }
+        self.members.group_id = group_id;
+        self.members.index = 0;
+        self.members.remove.clear();
+        self.members.add.clear();
+        self.screen = Screen::Members;
+        self.send(Cmd::ListSigners, commands);
+    }
+
+    fn members_key(&mut self, key: KeyEvent, commands: &Sender<Cmd>) {
+        let len = self.member_rows().len();
+        match key.code {
+            KeyCode::Esc => self.screen = Screen::Home,
+            KeyCode::Char('u') => self.send(Cmd::Refresh, commands),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.members.index = shift(self.members.index, -1, len);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.members.index = shift(self.members.index, 1, len);
+            }
+            KeyCode::Char(' ') => self.toggle_member(),
+            KeyCode::Enter => self.submit_members(commands),
+            _ => {}
+        }
+    }
+
+    fn toggle_member(&mut self) {
+        let Some(row) = self.member_rows().get(self.members.index).cloned() else {
+            return;
+        };
+        match row {
+            MemberRow::Present(name) => {
+                self.members.add.remove(&name);
+                if !self.members.remove.insert(name.clone()) {
+                    self.members.remove.remove(&name);
+                }
+            }
+            MemberRow::Candidate(name) => {
+                self.members.remove.remove(&name);
+                if !self.members.add.insert(name.clone()) {
+                    self.members.add.remove(&name);
+                }
+            }
+        }
+    }
+
+    fn submit_members(&mut self, commands: &Sender<Cmd>) {
+        let Some(group) = self.members_group().cloned() else {
+            self.local_error = Some("Выберите группу".into());
+            return;
+        };
+        let (add, remove) = self.chosen_members();
+        match membership_change(&group, &add, &remove) {
+            Ok((add, remove)) => {
+                self.send(
+                    Cmd::Reshare {
+                        group_id: group.id,
+                        add,
+                        remove,
+                    },
+                    commands,
+                );
+            }
+            Err(err) => self.local_error = Some(err),
+        }
     }
 
     fn message_key(&mut self, key: KeyEvent, commands: &Sender<Cmd>) {
@@ -522,6 +637,7 @@ impl App {
             Screen::Home => self.draw_home(frame),
             Screen::Create => self.draw_create(frame),
             Screen::Message => self.draw_message(frame),
+            Screen::Members => self.draw_members(frame),
         }
     }
 
@@ -547,7 +663,7 @@ impl App {
             .constraints([
                 Constraint::Length(3),
                 Constraint::Min(6),
-                Constraint::Length(4),
+                Constraint::Length(5),
             ])
             .split(frame.area());
         frame.render_widget(panel("Подпись MPC", self.header_lines()), rows[0]);
@@ -599,7 +715,7 @@ impl App {
         let mut keys =
             "Ctrl+Q выйти   Ctrl+W закрыть   u обновить   Tab вкладка   j/k выбор".to_string();
         if self.is_admin() {
-            keys.push_str("   n группа   d генерация   s на подпись");
+            keys.push_str("   n группа   d генерация   s на подпись   m состав");
         }
         keys.push_str("   a подписать   r отклонить");
         let mut lines = vec![Line::from(keys)];
@@ -761,6 +877,24 @@ impl App {
             lines.push(Line::from(
                 "Генерация ключа не удалась. Создайте новую группу.",
             ));
+        } else if group.status == "resharing" {
+            lines.push(Line::from(
+                "Идёт пересчёт долей. Это окно лучше не закрывать.",
+            ));
+        }
+        if group.i_created {
+            if let Some(events) = self
+                .state
+                .history
+                .get(&group.id)
+                .filter(|events| !events.is_empty())
+            {
+                lines.push(Line::from(""));
+                lines.push(Line::from("История"));
+                for event in events {
+                    lines.push(Line::from(event_line(event)));
+                }
+            }
         }
         if let Some(key) = &group.verifying_key_hex {
             lines.push(Line::from(format!("Ключ проверки {key}")));
@@ -771,6 +905,9 @@ impl App {
         if group.status == "active" && group.i_created {
             lines.push(Line::from(
                 "Клавиша s отправляет сообщение на подпись. Подписанты подтвердят его.",
+            ));
+            lines.push(Line::from(
+                "Клавиша m меняет состав: добавить или удалить участников.",
             ));
         }
         lines
@@ -957,6 +1094,136 @@ impl App {
         frame.render_widget(panel("На подпись", lines), frame.area());
     }
 
+    fn draw_members(&self, frame: &mut Frame) {
+        let mut lines = vec![
+            Line::from("Пробел отмечает изменение, Enter запускает пересчёт, Esc назад."),
+            Line::from(
+                "Порог и адрес Solana не меняются. У каждого, кто остаётся, и у нового участника должен быть открыт клиент.",
+            ),
+            Line::from(""),
+        ];
+        let Some(group) = self.members_group() else {
+            lines.push(Line::from("Группа недоступна."));
+            lines.push(self.banner());
+            frame.render_widget(panel("Состав группы", lines), frame.area());
+            return;
+        };
+        lines.insert(
+            0,
+            Line::from(format!(
+                "{} · порог {} из {}",
+                group.name, group.threshold, group.max_signers
+            )),
+        );
+        let rows = self.member_rows();
+        lines.push(Line::from("Убрать"));
+        let presents: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, MemberRow::Present(_)))
+            .collect();
+        if presents.is_empty() {
+            lines.push(Line::from("В группе никого нет."));
+        }
+        for (index, row) in presents {
+            let MemberRow::Present(name) = row else {
+                continue;
+            };
+            lines.push(selected_line(
+                index == self.members.index,
+                member_mark(self.members.remove.contains(name), name, group, true),
+            ));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from("Добавить"));
+        let candidates: Vec<_> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| matches!(row, MemberRow::Candidate(_)))
+            .collect();
+        if candidates.is_empty() {
+            lines.push(Line::from(
+                "Нет подписантов вне группы. Подписант появляется здесь после входа в клиент.",
+            ));
+        }
+        for (index, row) in candidates {
+            let MemberRow::Candidate(name) = row else {
+                continue;
+            };
+            lines.push(selected_line(
+                index == self.members.index,
+                member_mark(self.members.add.contains(name), name, group, false),
+            ));
+        }
+        lines.push(Line::from(""));
+        let (add, remove) = self.chosen_members();
+        if group.status != "active" {
+            lines.push(Line::from(
+                "Пересчёт долей доступен только активной группе.",
+            ));
+        } else if add.is_empty() && remove.is_empty() {
+            lines.push(Line::from("Отметьте, кого убрать или добавить."));
+        } else {
+            match membership_change(group, &add, &remove) {
+                Ok(_) => {
+                    let staying = group.members.len() - remove.len();
+                    let total = staying + add.len();
+                    lines.push(Line::from(format!(
+                        "Останется {staying}, всего {total}. Порог {}.",
+                        group.threshold
+                    )));
+                }
+                Err(err) => lines.push(red_line(err)),
+            }
+        }
+        lines.push(Line::from("u обновляет список подписантов."));
+        lines.push(self.banner());
+        frame.render_widget(panel("Состав группы", lines), frame.area());
+    }
+
+    fn members_group(&self) -> Option<&GroupDto> {
+        self.state
+            .groups
+            .iter()
+            .find(|group| group.id == self.members.group_id)
+    }
+
+    fn member_rows(&self) -> Vec<MemberRow> {
+        let Some(group) = self.members_group() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for member in &group.members {
+            rows.push(MemberRow::Present(member.username.clone()));
+        }
+        let present: HashSet<&str> = group
+            .members
+            .iter()
+            .map(|member| member.username.as_str())
+            .collect();
+        for signer in &self.state.signers {
+            if !present.contains(signer.username.as_str()) {
+                rows.push(MemberRow::Candidate(signer.username.clone()));
+            }
+        }
+        rows
+    }
+
+    fn chosen_members(&self) -> (Vec<String>, Vec<String>) {
+        let mut add = Vec::new();
+        let mut remove = Vec::new();
+        for row in self.member_rows() {
+            match row {
+                MemberRow::Present(name) if self.members.remove.contains(&name) => {
+                    remove.push(name);
+                }
+                MemberRow::Candidate(name) if self.members.add.contains(&name) => add.push(name),
+                _ => {}
+            }
+        }
+        (add, remove)
+    }
+
     fn banner(&self) -> Line<'static> {
         if let Some(error) = &self.local_error {
             return red_line(error.clone());
@@ -1032,6 +1299,24 @@ fn field_line(label: &str, value: &str, focused: bool, secret: bool) -> Line<'st
     Line::from(Span::styled(format!("{label}: {shown}{cursor}"), style))
 }
 
+fn member_mark(on: bool, name: &str, group: &GroupDto, present: bool) -> String {
+    let mark = if on { "[x]" } else { "[ ]" };
+    if !present {
+        return format!("{mark} {name}");
+    }
+    let Some(member) = group.members.iter().find(|member| member.username == name) else {
+        return format!("{mark} {name}");
+    };
+    let mut line = format!(
+        "{mark} {} · участник {}",
+        member.username, member.identifier
+    );
+    if member.box_public_hex.is_none() {
+        line.push_str(" · нет ключа устройства");
+    }
+    line
+}
+
 fn selected_line(selected: bool, text: String) -> Line<'static> {
     let style = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
@@ -1070,8 +1355,19 @@ fn group_status(status: &str) -> &str {
         "dkg" => "генерация ключа",
         "active" => "активна",
         "failed" => "ошибка",
+        "resharing" => "пересчёт долей",
         other => other,
     }
+}
+
+fn event_line(event: &GroupEventDto) -> String {
+    let action = match event.kind.as_str() {
+        "member_added" => "добавлен",
+        "member_removed" => "удалён",
+        other => other,
+    };
+    let when = event.created_at.chars().take(19).collect::<String>();
+    format!("{}: {action} {} · {when}", event.actor, event.subject)
 }
 
 fn message_label(request: &SignRequestDto) -> String {
@@ -1179,8 +1475,8 @@ fn share_line(has_share: bool, status: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{copy_payload, format_notice, is_ctrl, App, CopyPart};
-    use ai_signing_client::{GroupDto, SignRequestDto, UiState};
+    use super::{copy_payload, format_notice, is_ctrl, App, CopyPart, MemberRow};
+    use ai_signing_client::{GroupDto, MemberDto, SignRequestDto, SignerDto, UiState};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use uuid::Uuid;
 
@@ -1254,6 +1550,45 @@ mod tests {
         assert_eq!(err, "У группы нет публичного ключа");
     }
 
+    #[test]
+    fn member_rows_keep_members_and_offer_other_signers() {
+        let group_id = Uuid::from_u128(1);
+        let mut item = group(group_id, None);
+        item.threshold = 2;
+        item.members = vec![person("alice", 1), person("bob", 2), person("dave", 3)];
+        let mut state = empty_state();
+        state.groups = vec![item];
+        state.signers = vec![
+            SignerDto {
+                user_id: Uuid::from_u128(11),
+                username: "alice".into(),
+            },
+            SignerDto {
+                user_id: Uuid::from_u128(12),
+                username: "carol".into(),
+            },
+        ];
+        let mut app = App::new(state);
+        app.members.group_id = group_id;
+        assert_eq!(
+            app.member_rows(),
+            vec![
+                MemberRow::Present("alice".into()),
+                MemberRow::Present("bob".into()),
+                MemberRow::Present("dave".into()),
+                MemberRow::Candidate("carol".into()),
+            ]
+        );
+        app.members.remove.insert("dave".into());
+        app.members.add.insert("carol".into());
+        let (add, remove) = app.chosen_members();
+        let plan =
+            ai_signing_client::membership_change(app.members_group().unwrap(), &add, &remove)
+                .unwrap();
+        assert_eq!(plan.0, vec!["carol".to_string()]);
+        assert_eq!(plan.1, vec!["dave".to_string()]);
+    }
+
     fn empty_state() -> UiState {
         UiState {
             server_url: "http://127.0.0.1:8080".into(),
@@ -1266,6 +1601,7 @@ mod tests {
             requests: Vec::new(),
             signers: Vec::new(),
             shares: Default::default(),
+            history: Default::default(),
             unlocked: true,
         }
     }
@@ -1284,6 +1620,15 @@ mod tests {
             i_created: true,
             my_identifier: None,
             members: Vec::new(),
+        }
+    }
+
+    fn person(name: &str, identifier: u16) -> MemberDto {
+        MemberDto {
+            user_id: Uuid::from_u128(u128::from(identifier)),
+            username: name.into(),
+            identifier,
+            box_public_hex: Some("aa".into()),
         }
     }
 

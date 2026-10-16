@@ -41,6 +41,7 @@ tracing.workspace = true
 [dev-dependencies]
 ai-signing-server = { path = "../server" }
 bs58 = "0.5"
+frost-ed25519 = "3"
 futures = "0.3"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "net"] }

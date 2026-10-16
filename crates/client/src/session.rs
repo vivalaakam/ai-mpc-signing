@@ -5,8 +5,8 @@ use std::{
 };
 
 use ai_signing_protocol::{
-    role_title, AuthResponse, CertificateMaterial, ClientMsg, GroupDto, Participant, ServerMsg,
-    SignRequestDto, SignerDto, UserProfile, ROLE_ADMIN,
+    role_title, AuthResponse, CertificateMaterial, ClientMsg, GroupDto, GroupEventDto, Participant,
+    ServerMsg, SignRequestDto, SignerDto, UserProfile, ROLE_ADMIN,
 };
 use async_channel::Sender;
 use futures::{SinkExt, StreamExt};
@@ -60,12 +60,21 @@ pub enum Cmd {
     Reject {
         request_id: Uuid,
     },
+    Reshare {
+        group_id: Uuid,
+        add: Vec<String>,
+        remove: Vec<String>,
+    },
+    History {
+        group_id: Uuid,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub struct SettleWait {
     pub group_id: Uuid,
     pub timeout: Duration,
+    pub timeout_message: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -82,6 +91,8 @@ pub struct Reply {
     pub signers: Vec<SignerDto>,
     pub group: Option<GroupDto>,
     pub request: Option<SignRequestDto>,
+    #[serde(default)]
+    pub events: Vec<GroupEventDto>,
 }
 
 impl Reply {
@@ -99,6 +110,7 @@ impl Reply {
             signers: Vec::new(),
             group: None,
             request: None,
+            events: Vec::new(),
         }
     }
 }
@@ -115,6 +127,7 @@ pub struct UiState {
     pub requests: Vec<SignRequestDto>,
     pub signers: Vec<SignerDto>,
     pub shares: HashMap<Uuid, bool>,
+    pub history: HashMap<Uuid, Vec<GroupEventDto>>,
     pub unlocked: bool,
 }
 
@@ -131,6 +144,7 @@ impl UiState {
             requests: Vec::new(),
             signers: Vec::new(),
             shares: HashMap::new(),
+            history: HashMap::new(),
             unlocked: false,
         }
     }
@@ -146,6 +160,7 @@ struct Settle {
     group_id: Uuid,
     deadline: Instant,
     reply: tokio::sync::oneshot::Sender<Reply>,
+    timeout_message: String,
 }
 
 /// Opens the window session. The socket makes this the only ceremony on `listener`'s path.
@@ -412,6 +427,9 @@ struct Session {
     parties: HashMap<Uuid, Participant>,
     focus_group: Option<GroupDto>,
     focus_request: Option<SignRequestDto>,
+    focus_events: Vec<GroupEventDto>,
+    history: HashMap<Uuid, Vec<GroupEventDto>>,
+    preserve_error: bool,
     auto_approve: bool,
 }
 
@@ -446,6 +464,9 @@ async fn run(
         parties: HashMap::new(),
         focus_group: None,
         focus_request: None,
+        focus_events: Vec::new(),
+        history: HashMap::new(),
+        preserve_error: false,
         auto_approve,
         store,
         http,
@@ -535,6 +556,7 @@ async fn run(
                             group_id: wait.group_id,
                             deadline: Instant::now() + wait.timeout,
                             reply,
+                            timeout_message: wait.timeout_message,
                         });
                     } else {
                         let _ = reply.send(session.reply());
@@ -580,10 +602,11 @@ fn pump_settle(session: &mut Session, settle: &mut Option<Settle>) {
     let timed_out = Instant::now() >= pending.deadline;
     if done || timed_out {
         if timed_out && !done {
-            session.error = Some("генерация ключа не завершилась".into());
-        } else if status == Some("active") {
+            session.error = Some(pending.timeout_message);
+        } else if status == Some("active") && !session.preserve_error {
             session.error = None;
         }
+        session.preserve_error = false;
         if session.focus_group.is_none() {
             session.focus_group = session
                 .groups
@@ -694,6 +717,7 @@ impl Session {
             requests: self.requests.clone(),
             signers: self.signers.clone(),
             shares,
+            history: self.history.clone(),
             unlocked: self.vault.is_some(),
         });
     }
@@ -712,6 +736,7 @@ impl Session {
             signers: self.signers.clone(),
             group: self.focus_group.clone(),
             request: self.focus_request.clone(),
+            events: self.focus_events.clone(),
         }
     }
 
@@ -756,6 +781,7 @@ impl Session {
         self.notice = None;
         self.focus_group = None;
         self.focus_request = None;
+        self.focus_events.clear();
         let outcome = match cmd {
             Cmd::Login { username, password } => {
                 self.auth("/api/login", &username, &password).await
@@ -869,6 +895,40 @@ impl Session {
             }
             Cmd::Approve { request_id } => self.decide(request_id, true).await,
             Cmd::Reject { request_id } => self.decide(request_id, false).await,
+            Cmd::Reshare {
+                group_id,
+                add,
+                remove,
+            } => {
+                self.preserve_error = false;
+                let group: Result<GroupDto, CallError> = self
+                    .post(
+                        &format!("/api/groups/{group_id}/reshare"),
+                        &serde_json::json!({ "add": add, "remove": remove }),
+                    )
+                    .await;
+                match group {
+                    Ok(group) => {
+                        self.focus_group = Some(group.clone());
+                        self.adopt_group(group);
+                        self.notice = Some("Пересчёт долей запущен".into());
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Cmd::History { group_id } => {
+                let events: Result<Vec<GroupEventDto>, CallError> =
+                    self.get(&format!("/api/groups/{group_id}/history")).await;
+                match events {
+                    Ok(events) => {
+                        self.history.insert(group_id, events.clone());
+                        self.focus_events = events;
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            }
             Cmd::ListSigners => {
                 let signers: Result<Vec<SignerDto>, CallError> = self.get("/api/signers").await;
                 match signers {
@@ -1109,8 +1169,31 @@ impl Session {
         for group in groups {
             self.adopt_group(group);
         }
+        self.load_histories().await;
         self.approve_pending().await?;
         Ok(())
+    }
+
+    async fn load_histories(&mut self) {
+        if self.role.as_deref() != Some(ROLE_ADMIN) {
+            return;
+        }
+        let ids: Vec<Uuid> = self
+            .groups
+            .iter()
+            .filter(|group| group.i_created)
+            .map(|group| group.id)
+            .collect();
+        for id in ids {
+            self.load_history(id).await;
+        }
+    }
+
+    async fn load_history(&mut self, group_id: Uuid) {
+        let path = format!("/api/groups/{group_id}/history");
+        if let Ok(events) = self.get::<Vec<GroupEventDto>>(&path).await {
+            self.history.insert(group_id, events);
+        }
     }
 
     fn adopt_group(&mut self, group: GroupDto) {
@@ -1160,6 +1243,7 @@ impl Session {
                             .map_err(|err| err.to_string())
                     })?);
                 }
+                self.load_histories().await;
             }
             ServerMsg::GroupUpdated { group } => {
                 let group = group.clone();
@@ -1173,6 +1257,9 @@ impl Session {
                             .set_group(group.clone())
                             .map_err(|err| err.to_string())
                     })?);
+                }
+                if group.i_created {
+                    self.load_history(group.id).await;
                 }
             }
             ServerMsg::SignRequest { request } => self.upsert_request(request.clone()),
@@ -1250,6 +1337,45 @@ impl Session {
                     produced.extend(self.drive(group_id, &message)?);
                 }
             }
+            ServerMsg::ReshareCompleted {
+                group_id,
+                verifying_key_hex,
+            } => {
+                let group_id = *group_id;
+                let verifying_key_hex = verifying_key_hex.clone();
+                self.preserve_error = false;
+                if let Some(group) = self.groups.iter_mut().find(|group| group.id == group_id) {
+                    if group.verifying_key_hex.as_deref() != Some(verifying_key_hex.as_str())
+                        && group.verifying_key_hex.is_some()
+                    {
+                        self.preserve_error = true;
+                        self.error = Some("пересчёт изменил ключ группы".into());
+                    }
+                }
+                produced.extend(self.drive(group_id, &message)?);
+                if self.error.is_none() {
+                    self.notice = Some("Доли пересчитаны".into());
+                }
+            }
+            ServerMsg::ReshareFailed {
+                group_id,
+                message: reason,
+            } => {
+                let group_id = *group_id;
+                self.preserve_error = true;
+                self.error = Some(reason.clone());
+                produced.extend(self.drive(group_id, &message)?);
+            }
+            ServerMsg::ReshareStarted { group_id, .. }
+            | ServerMsg::ReshareRound1 { group_id, .. }
+            | ServerMsg::ReshareRound2 { group_id, .. }
+            | ServerMsg::ReshareRepair { group_id, .. }
+            | ServerMsg::ReshareDelta { group_id, .. }
+            | ServerMsg::ReshareSigma { group_id, .. }
+            | ServerMsg::ReshareSigmaCommit { group_id, .. }
+            | ServerMsg::ReshareVerifying { group_id, .. } => {
+                produced.extend(self.drive(*group_id, &message)?);
+            }
         }
         self.send_client(outgoing, produced);
         if matches!(
@@ -1271,8 +1397,26 @@ impl Session {
         else {
             return Ok(Vec::new());
         };
-        self.with_party(&group, |party| {
-            party.handle(message).map_err(|err| err.to_string())
+        let reshare = matches!(
+            message,
+            ServerMsg::ReshareStarted { .. }
+                | ServerMsg::ReshareRound1 { .. }
+                | ServerMsg::ReshareRound2 { .. }
+                | ServerMsg::ReshareRepair { .. }
+                | ServerMsg::ReshareDelta { .. }
+                | ServerMsg::ReshareSigma { .. }
+                | ServerMsg::ReshareSigmaCommit { .. }
+                | ServerMsg::ReshareVerifying { .. }
+                | ServerMsg::ReshareCompleted { .. }
+                | ServerMsg::ReshareFailed { .. }
+        );
+        self.with_party(&group, |party| match party.handle(message) {
+            Ok(messages) => Ok(messages),
+            Err(err) if reshare => Ok(vec![ClientMsg::ReshareAbort {
+                group_id,
+                reason: err.to_string(),
+            }]),
+            Err(err) => Err(err.to_string()),
         })
     }
 

@@ -7,14 +7,16 @@
 
 mod certificate;
 mod engine;
+mod reshare;
 
 pub use certificate::{
     canonical_public_key, verify_certificate_login, CertificateFile, CertificateLogin,
     CertificateMaterial,
 };
 pub use engine::{
-    aggregate_signature, message_preview, message_text, package_verifying_key_hex, recode_hex,
-    verify_ed25519, DeviceKey, DkgLocal, HdIdentity, Participant, ParticipantBlobDto,
+    aggregate_signature, canonical_public_package, message_preview, message_text,
+    package_signer_ids, package_verifying_key_hex, recode_hex, verify_ed25519, DeviceKey, DkgLocal,
+    HdIdentity, Participant, ParticipantBlobDto,
 };
 
 use serde::{Deserialize, Serialize};
@@ -131,6 +133,30 @@ pub struct AddMemberRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReshareRequest {
+    pub add: Vec<String>,
+    pub remove: Vec<String>,
+}
+
+/// One row of the group membership history. `kind` is `member_added` or `member_removed`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GroupEventDto {
+    pub id: Uuid,
+    pub group_id: Uuid,
+    pub kind: String,
+    pub actor: String,
+    pub subject: String,
+    pub created_at: String,
+}
+
+/// Device key of one party in a reshare, keyed by FROST identifier.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RosterKey {
+    pub identifier: u16,
+    pub box_public_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceKeyRequest {
     pub public_key_hex: String,
 }
@@ -191,6 +217,42 @@ pub enum ClientMsg {
     },
     SignAbort {
         request_id: Uuid,
+        reason: String,
+    },
+    ReshareRound1 {
+        group_id: Uuid,
+        package: String,
+    },
+    ReshareRound2 {
+        group_id: Uuid,
+        packages: Vec<SealedPackage>,
+    },
+    ReshareRefreshPublic {
+        group_id: Uuid,
+        public_key_package: String,
+    },
+    ReshareDelta {
+        group_id: Uuid,
+        joiner: u16,
+        packages: Vec<SealedPackage>,
+    },
+    ReshareSigma {
+        group_id: Uuid,
+        joiner: u16,
+        ciphertext: String,
+        commitment: String,
+    },
+    ReshareVerifying {
+        group_id: Uuid,
+        joiner: u16,
+        verifying_share: String,
+    },
+    ResharePublic {
+        group_id: Uuid,
+        public_key_package: String,
+    },
+    ReshareAbort {
+        group_id: Uuid,
         reason: String,
     },
 }
@@ -254,6 +316,60 @@ pub enum ServerMsg {
     },
     SignFailed {
         request_id: Uuid,
+        message: String,
+    },
+    ReshareStarted {
+        group_id: Uuid,
+        generation: u32,
+        threshold: u16,
+        stayers: Vec<u16>,
+        joiners: Vec<u16>,
+        keys: Vec<RosterKey>,
+    },
+    ReshareRound1 {
+        group_id: Uuid,
+        from: u16,
+        package: String,
+    },
+    ReshareRound2 {
+        group_id: Uuid,
+        from: u16,
+        ciphertext: String,
+    },
+    ReshareRepair {
+        group_id: Uuid,
+        public_key_package: String,
+    },
+    ReshareDelta {
+        group_id: Uuid,
+        joiner: u16,
+        from: u16,
+        ciphertext: String,
+    },
+    ReshareSigma {
+        group_id: Uuid,
+        joiner: u16,
+        from: u16,
+        ciphertext: String,
+        commitment: String,
+    },
+    ReshareSigmaCommit {
+        group_id: Uuid,
+        joiner: u16,
+        from: u16,
+        commitment: String,
+    },
+    ReshareVerifying {
+        group_id: Uuid,
+        joiner: u16,
+        verifying_share: String,
+    },
+    ReshareCompleted {
+        group_id: Uuid,
+        verifying_key_hex: String,
+    },
+    ReshareFailed {
+        group_id: Uuid,
         message: String,
     },
 }

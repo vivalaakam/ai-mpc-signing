@@ -37,6 +37,8 @@ r отклонить. В новой группе пробел отмечает �
   create-group НАЗВАНИЕ T ИМЯ...   создать группу, 2 ≤ t ≤ n ≤ 16
   add-member ID ИМЯ                добавить участника в недособранную группу
   start-dkg ID                     запустить генерацию ключа
+  reshare ID add|remove ИМЯ...     пересчитать доли: добавить или удалить участников
+  history ID                       история добавления и удаления участников
   request-solana ID АДРЕС LAMPORTS создать перевод Solana для подтверждения
   inbox                            запросы на подпись
   approve ID                       подтвердить подпись
@@ -91,11 +93,17 @@ fn run() -> Result<(), String> {
         return emit(kind, reply);
     }
     let (store, server) = open(&launch)?;
-    let connect = matches!(kind, Kind::StartDkg);
+    let connect = matches!(kind, Kind::StartDkg | Kind::Reshare);
     let wait = match kind {
         Kind::StartDkg => Some(SettleWait {
             group_id: group_id_of(&cmd)?,
             timeout: Duration::from_secs(90),
+            timeout_message: "генерация ключа не завершилась".into(),
+        }),
+        Kind::Reshare => Some(SettleWait {
+            group_id: group_id_of(&cmd)?,
+            timeout: Duration::from_secs(90),
+            timeout_message: "пересчёт долей не завершился".into(),
         }),
         _ => None,
     };
@@ -120,6 +128,8 @@ enum Kind {
     Signers,
     Decide,
     StartDkg,
+    Reshare,
+    History,
     RequestSign,
     RequestSolana,
 }
@@ -194,6 +204,26 @@ fn parse_command(command: &str, args: &[String]) -> Result<(Cmd, Kind), String> 
                     group_id: parse_id(&args[0], "группы")?,
                 },
                 Kind::StartDkg,
+            ))
+        }
+        "reshare" => {
+            let (group_id, add, remove) = parse_reshare(args)?;
+            Ok((
+                Cmd::Reshare {
+                    group_id,
+                    add,
+                    remove,
+                },
+                Kind::Reshare,
+            ))
+        }
+        "history" => {
+            need(1, "history ID")?;
+            Ok((
+                Cmd::History {
+                    group_id: parse_id(&args[0], "группы")?,
+                },
+                Kind::History,
             ))
         }
         "request-sign" => {
@@ -286,7 +316,7 @@ fn emit(kind: Kind, reply: Reply) -> Result<(), String> {
                 .ok_or_else(|| "группа не найдена".to_string())?;
             print_json(group)
         }
-        Kind::MutateGroup | Kind::StartDkg => {
+        Kind::MutateGroup | Kind::StartDkg | Kind::Reshare => {
             let group = reply
                 .group
                 .ok_or_else(|| "сервер не вернул группу".to_string())?;
@@ -294,6 +324,7 @@ fn emit(kind: Kind, reply: Reply) -> Result<(), String> {
         }
         Kind::Inbox => print_json(&reply.requests),
         Kind::Signers => print_json(&reply.signers),
+        Kind::History => print_json(&reply.events),
         Kind::Decide | Kind::RequestSign | Kind::RequestSolana => {
             let request = reply
                 .request
@@ -311,9 +342,32 @@ fn print_json(value: &impl serde::Serialize) -> Result<(), String> {
 
 fn group_id_of(cmd: &Cmd) -> Result<Uuid, String> {
     match cmd {
-        Cmd::StartDkg { group_id } => Ok(*group_id),
-        _ => Err("ожидалась команда генерации ключа".into()),
+        Cmd::StartDkg { group_id } | Cmd::Reshare { group_id, .. } => Ok(*group_id),
+        _ => Err("ожидалась команда с группой".into()),
     }
+}
+
+fn parse_reshare(args: &[String]) -> Result<(Uuid, Vec<String>, Vec<String>), String> {
+    if args.len() < 3 || args.len().is_multiple_of(2) {
+        return Err("использование: reshare ID add|remove ИМЯ [add|remove ИМЯ]...".into());
+    }
+    let group_id = parse_id(&args[0], "группы")?;
+    let mut add = Vec::new();
+    let mut remove = Vec::new();
+    let mut index = 1;
+    while index < args.len() {
+        let name = args[index + 1].trim().to_string();
+        if name.is_empty() {
+            return Err("укажите имя участника".into());
+        }
+        match args[index].as_str() {
+            "add" => add.push(name),
+            "remove" => remove.push(name),
+            _ => return Err("использование: reshare ID add|remove ИМЯ [add|remove ИМЯ]...".into()),
+        }
+        index += 2;
+    }
+    Ok((group_id, add, remove))
 }
 
 fn parse_id(value: &str, what: &str) -> Result<Uuid, String> {

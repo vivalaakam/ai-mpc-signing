@@ -11,6 +11,7 @@ anyhow = "1"
 argon2 = "0.5"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", features = ["serde"] }
+dotenvy = "0.15"
 futures = "0.3"
 hex = "0.4"
 rand = "0.8"

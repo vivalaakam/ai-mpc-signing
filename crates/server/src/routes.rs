@@ -3,8 +3,8 @@ use std::collections::HashSet;
 use ai_signing_protocol::{
     canonical_public_key, canonical_role, decode_sign_message, verify_certificate_login,
     AddMemberRequest, AuthResponse, CertificateLogin, CreateGroupRequest, CreateSignBody,
-    CreateSolanaTransferBody, DeviceKeyRequest, GroupDto, SignRequestDto, SignStatusResponse,
-    SignerDto, UserProfile, ROLE_ADMIN, ROLE_SIGNER,
+    CreateSolanaTransferBody, DeviceKeyRequest, GroupDto, GroupEventDto, ReshareRequest,
+    SignRequestDto, SignStatusResponse, SignerDto, UserProfile, ROLE_ADMIN, ROLE_SIGNER,
 };
 use argon2::{
     password_hash::{rand_core::OsRng, SaltString},
@@ -45,6 +45,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/groups/{id}/device", put(set_group_device))
         .route("/api/groups/{id}/members", post(add_member))
         .route("/api/groups/{id}/dkg", post(start_dkg))
+        .route("/api/groups/{id}/reshare", post(start_reshare))
+        .route("/api/groups/{id}/history", get(group_history))
         .route("/api/groups/{id}/requests", post(create_sign_request))
         .route(
             "/api/groups/{id}/solana-transfers",
@@ -536,9 +538,13 @@ async fn set_group_device(
         ));
     };
     if current.as_deref() == Some(public_hex.as_str()) {
+        if status == "resharing" {
+            crate::reshare::note_device(&state, group_id).await?;
+        }
         return Ok(StatusCode::NO_CONTENT);
     }
-    if status != "forming" {
+    let joining = status == "resharing" && current.is_none();
+    if status != "forming" && !joining {
         return Err(bad("ключ участника уже зафиксирован"));
     }
     sqlx::query("UPDATE group_members SET box_public = $3 WHERE group_id = $1 AND user_id = $2")
@@ -549,6 +555,9 @@ async fn set_group_device(
         .await
         .map_err(ApiError::db)?;
     publish_group(&state, group_id).await?;
+    if joining {
+        crate::reshare::note_device(&state, group_id).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -618,6 +627,9 @@ async fn create_group(
         .execute(&mut *tx)
         .await
         .map_err(ApiError::db)?;
+        db::insert_group_event(&mut *tx, id, "member_added", &user.username, username)
+            .await
+            .map_err(ApiError::db)?;
     }
     tx.commit().await.map_err(ApiError::db)?;
     publish_group(&state, id).await?;
@@ -728,13 +740,18 @@ async fn add_member(
         ));
     }
     let identifier = group.members.len() as i32 + 1;
+    let mut tx = state.pool.begin().await.map_err(ApiError::db)?;
     sqlx::query("INSERT INTO group_members (group_id, user_id, identifier) VALUES ($1, $2, $3)")
         .bind(id)
         .bind(member)
         .bind(identifier)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await
         .map_err(ApiError::db)?;
+    db::insert_group_event(&mut *tx, id, "member_added", &user.username, username)
+        .await
+        .map_err(ApiError::db)?;
+    tx.commit().await.map_err(ApiError::db)?;
     publish_group(&state, id).await?;
     Ok(Json(
         db::load_group(&state.pool, id, user.id)
@@ -757,6 +774,56 @@ async fn start_dkg(
     ceremony::start_dkg(&state, user.id, id).await?;
     Ok(Json(
         db::load_group(&state.pool, id, user.id)
+            .await
+            .map_err(ApiError::db)?,
+    ))
+}
+
+async fn start_reshare(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ReshareRequest>,
+) -> Result<Json<GroupDto>, ApiError> {
+    if user.role != ROLE_ADMIN {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "пересчёт долей запускает администратор",
+        ));
+    }
+    crate::reshare::start(&state, user.id, id, body.add, body.remove).await?;
+    Ok(Json(
+        db::load_group(&state.pool, id, user.id)
+            .await
+            .map_err(ApiError::db)?,
+    ))
+}
+
+async fn group_history(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<GroupEventDto>>, ApiError> {
+    if user.role != ROLE_ADMIN {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "историю группы видит администратор",
+        ));
+    }
+    let group = db::load_group(&state.pool, id, user.id)
+        .await
+        .map_err(|err| match err {
+            sqlx::Error::RowNotFound => ApiError::new(StatusCode::NOT_FOUND, "группа не найдена"),
+            other => ApiError::db(other),
+        })?;
+    if !group.i_created {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "историю группы видит её создатель",
+        ));
+    }
+    Ok(Json(
+        db::list_group_events(&state.pool, id)
             .await
             .map_err(ApiError::db)?,
     ))

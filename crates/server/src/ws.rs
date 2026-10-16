@@ -46,9 +46,14 @@ async fn connected(
             groups.push(db::load_group(&state.pool, id, user_id).await?);
         }
         let requests = db::list_requests(&state.pool, user_id).await?;
-        let replay = ceremony::replay(&state, user_id)
+        let mut replay = ceremony::replay(&state, user_id)
             .await
             .map_err(|err| sqlx::Error::Protocol(err.message))?;
+        replay.extend(
+            crate::reshare::replay(&state, user_id)
+                .await
+                .map_err(|err| sqlx::Error::Protocol(err.message))?,
+        );
         Ok::<_, sqlx::Error>((groups, requests, replay))
     };
     let Ok((groups, requests, replay)) = snapshot.await else {
@@ -142,6 +147,39 @@ async fn handle_text(state: &AppState, user: Uuid, text: &str) -> Result<(), Api
         }
         ClientMsg::SignAbort { request_id, reason } => {
             ceremony::sign_abort(state, user, request_id, reason).await
+        }
+        ClientMsg::ReshareRound1 { group_id, package } => {
+            crate::reshare::round1(state, user, group_id, package).await
+        }
+        ClientMsg::ReshareRound2 { group_id, packages } => {
+            crate::reshare::round2(state, user, group_id, packages).await
+        }
+        ClientMsg::ReshareRefreshPublic {
+            group_id,
+            public_key_package,
+        } => crate::reshare::refresh_public(state, user, group_id, public_key_package).await,
+        ClientMsg::ReshareDelta {
+            group_id,
+            joiner,
+            packages,
+        } => crate::reshare::delta(state, user, group_id, joiner, packages).await,
+        ClientMsg::ReshareSigma {
+            group_id,
+            joiner,
+            ciphertext,
+            commitment,
+        } => crate::reshare::sigma(state, user, group_id, joiner, ciphertext, commitment).await,
+        ClientMsg::ReshareVerifying {
+            group_id,
+            joiner,
+            verifying_share,
+        } => crate::reshare::verifying(state, user, group_id, joiner, verifying_share).await,
+        ClientMsg::ResharePublic {
+            group_id,
+            public_key_package,
+        } => crate::reshare::final_public(state, user, group_id, public_key_package).await,
+        ClientMsg::ReshareAbort { group_id, reason } => {
+            crate::reshare::abort(state, user, group_id, reason).await
         }
     }
 }

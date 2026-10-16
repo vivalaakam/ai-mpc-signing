@@ -16,6 +16,12 @@ const ROLE: &str = "role";
 const DEVICE_SECRET: &str = "device_secret";
 const VAULT: &str = "vault";
 
+pub struct ShareEpoch {
+    pub epoch: i64,
+    pub key: String,
+    pub pubkey: Option<String>,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -49,6 +55,13 @@ impl Store {
                 group_id TEXT NOT NULL,
                 blob TEXT NOT NULL,
                 PRIMARY KEY (user_id, group_id)
+            );
+            CREATE TABLE IF NOT EXISTS share_epochs (
+                user_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                epoch INTEGER NOT NULL,
+                blob TEXT NOT NULL,
+                PRIMARY KEY (user_id, group_id, epoch)
             );",
         )
         .map_err(|err| err.to_string())?;
@@ -148,6 +161,7 @@ impl Store {
         vault: &Vault,
     ) -> Result<(), String> {
         let json = serde_json::to_string(blob).map_err(|err| err.to_string())?;
+        self.remember_epoch(user_id, group_id, blob, vault)?;
         let sealed = vault.seal_share(&json)?;
         self.conn
             .execute(
@@ -157,6 +171,83 @@ impl Store {
             )
             .map_err(|err| err.to_string())?;
         Ok(())
+    }
+
+    /// Every distinct signing share this device has held for the group, oldest first.
+    /// Epochs are append-only: a removed participant keeps the share they had.
+    pub fn load_epochs(
+        &self,
+        user_id: Uuid,
+        group_id: Uuid,
+        vault: &Vault,
+    ) -> Result<Vec<ShareEpoch>, String> {
+        let rows = self.epoch_rows(user_id, group_id)?;
+        let mut epochs = Vec::with_capacity(rows.len());
+        for (epoch, sealed) in rows {
+            epochs.push(self.open_epoch(epoch, &sealed, vault)?);
+        }
+        Ok(epochs)
+    }
+
+    fn remember_epoch(
+        &self,
+        user_id: Uuid,
+        group_id: Uuid,
+        blob: &ParticipantBlobDto,
+        vault: &Vault,
+    ) -> Result<(), String> {
+        let Some(key) = blob.key.as_deref() else {
+            return Ok(());
+        };
+        let rows = self.epoch_rows(user_id, group_id)?;
+        if let Some((_, sealed)) = rows.last() {
+            if self.open_epoch(0, sealed, vault)?.key == key {
+                return Ok(());
+            }
+        }
+        let snapshot = serde_json::json!({ "key": key, "pubkey": blob.pubkey });
+        let sealed = vault.seal_share(&snapshot.to_string())?;
+        let epoch = rows.last().map(|(epoch, _)| epoch + 1).unwrap_or(0);
+        self.conn
+            .execute(
+                "INSERT INTO share_epochs (user_id, group_id, epoch, blob) VALUES (?1, ?2, ?3, ?4)",
+                (user_id.to_string(), group_id.to_string(), epoch, sealed),
+            )
+            .map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn epoch_rows(&self, user_id: Uuid, group_id: Uuid) -> Result<Vec<(i64, String)>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT epoch, blob FROM share_epochs
+                 WHERE user_id = ?1 AND group_id = ?2 ORDER BY epoch",
+            )
+            .map_err(|err| err.to_string())?;
+        let rows = statement
+            .query_map((user_id.to_string(), group_id.to_string()), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|err| err.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.to_string())
+    }
+
+    fn open_epoch(&self, epoch: i64, sealed: &str, vault: &Vault) -> Result<ShareEpoch, String> {
+        let json = vault.open_share(sealed)?;
+        let value: serde_json::Value =
+            serde_json::from_str(&json).map_err(|_| "эпоха доли повреждена".to_string())?;
+        let key = value
+            .get("key")
+            .and_then(|item| item.as_str())
+            .ok_or_else(|| "эпоха доли повреждена".to_string())?
+            .to_string();
+        let pubkey = value
+            .get("pubkey")
+            .and_then(|item| item.as_str())
+            .map(str::to_string);
+        Ok(ShareEpoch { epoch, key, pubkey })
     }
 
     fn get_kv(&self, key: &str) -> Result<Option<String>, String> {
@@ -201,6 +292,7 @@ mod tests {
         let group = Uuid::new_v4();
         let blob = ParticipantBlobDto {
             dkg: None,
+            reshare: None,
             key: Some("share".into()),
             pubkey: Some("pub".into()),
             signs: vec![],
@@ -226,6 +318,35 @@ mod tests {
                 assert_eq!(wal_mode & 0o777, 0o600);
             }
         }
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn share_epochs_keep_every_key() {
+        let dir = std::env::temp_dir().join(format!("ai-signing-epochs-{}", Uuid::new_v4()));
+        let store = Store::open_path(&dir.join("client.sqlite")).unwrap();
+        let vault = crate::vault::Vault::unlock_or_create(&store, "password1").unwrap();
+        let user = Uuid::new_v4();
+        let group = Uuid::new_v4();
+        let mut blob = ParticipantBlobDto {
+            dkg: None,
+            reshare: None,
+            key: Some("epoch-zero".into()),
+            pubkey: Some("pub-0".into()),
+            signs: vec![],
+        };
+        store.save_share(user, group, &blob, &vault).unwrap();
+        store.save_share(user, group, &blob, &vault).unwrap();
+        blob.key = Some("epoch-one".into());
+        blob.pubkey = Some("pub-1".into());
+        store.save_share(user, group, &blob, &vault).unwrap();
+        let epochs = store.load_epochs(user, group, &vault).unwrap();
+        assert_eq!(epochs.len(), 2);
+        assert_eq!(epochs[0].epoch, 0);
+        assert_eq!(epochs[0].key, "epoch-zero");
+        assert_eq!(epochs[1].key, "epoch-one");
+        assert_eq!(epochs[1].pubkey.as_deref(), Some("pub-1"));
         drop(store);
         let _ = std::fs::remove_dir_all(&dir);
     }
