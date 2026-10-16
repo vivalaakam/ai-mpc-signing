@@ -1,0 +1,169 @@
+import { Button, LineEdit, VerticalBox, HorizontalBox, ScrollView, ListView } from "std-widgets.slint";
+import { SignerRow } from "types.slint";
+
+export component CreateGroupWizard {
+    in property <bool> open;
+    in property <bool> busy;
+    in property <int> create-wizard-step;
+    in property <string> create-wizard-error;
+    in property <string> create-wizard-summary;
+    in-out property <string> group-name-input;
+    in-out property <string> threshold-input;
+    in-out property <string> signer-search;
+    in property <[SignerRow]> signer-pick;
+
+    callback create-wizard-cancel();
+    callback create-wizard-back();
+    callback create-wizard-next();
+    callback create-wizard-create();
+    callback signer-search-changed(string);
+    callback toggle-signer(string);
+
+    if root.open: Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #00000066;
+        TouchArea { }
+
+        Rectangle {
+            width: min(480px, parent.width - 40px);
+            height: root.create-wizard-step == 0 ? 240px : min(480px, parent.height - 40px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #fff;
+            border-radius: 10px;
+            border-width: 1px;
+            border-color: #ccc;
+            clip: true;
+
+            VerticalBox {
+                padding: root.create-wizard-step == 0 ? 12px : 16px;
+                spacing: root.create-wizard-step == 0 ? 6px : 10px;
+
+                Text {
+                    text: "Новая группа";
+                    font-size: root.create-wizard-step == 0 ? 16px : 18px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.create-wizard-step == 0 ? "Шаг 1 из 3 · параметры"
+                        : root.create-wizard-step == 1 ? "Шаг 2 из 3 · участники"
+                        : "Шаг 3 из 3 · проверка";
+                    color: #666;
+                    font-size: 12px;
+                }
+
+                if root.create-wizard-step == 0: VerticalBox {
+                    spacing: 6px;
+                    Text { text: "Название"; font-size: 12px; color: #666; }
+                    wizard-name := LineEdit {
+                        text <=> root.group-name-input;
+                        placeholder-text: "название группы";
+                    }
+                    HorizontalBox {
+                        spacing: 8px;
+                        Text { text: "Порог t"; vertical-alignment: center; font-size: 12px; color: #666; }
+                        wizard-threshold := LineEdit {
+                            text <=> root.threshold-input;
+                            min-width: 64px;
+                        }
+                        Text { text: "(2…16)"; vertical-alignment: center; color: #888; font-size: 11px; }
+                    }
+                }
+
+                if root.create-wizard-step == 1: VerticalBox {
+                    spacing: 6px;
+                    vertical-stretch: 1;
+                    signer-search-field := LineEdit {
+                        text <=> root.signer-search;
+                        placeholder-text: "Поиск по имени";
+                        edited(text) => { root.signer-search-changed(text); }
+                    }
+                    ScrollView {
+                        vertical-stretch: 1;
+                        ListView {
+                            for signer[i] in root.signer-pick: Rectangle {
+                                height: 42px;
+                                border-radius: 8px;
+                                background: signer.picked ? #2563eb : #f4f4f5;
+                                border-width: 1px;
+                                border-color: signer.picked ? #1d4ed8 : #e4e4e7;
+                                TouchArea {
+                                    clicked => { root.toggle-signer(signer.username); }
+                                }
+                                HorizontalBox {
+                                    padding: 10px;
+                                    spacing: 8px;
+                                    Rectangle {
+                                        width: 18px;
+                                        height: 18px;
+                                        border-radius: 4px;
+                                        background: signer.picked ? #fff : transparent;
+                                        border-width: 1px;
+                                        border-color: signer.picked ? #fff : #a1a1aa;
+                                        Text {
+                                            text: signer.picked ? "✓" : "";
+                                            color: #2563eb;
+                                            font-size: 12px;
+                                            font-weight: 700;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Text {
+                                        text: signer.username;
+                                        color: signer.picked ? #fff : #18181b;
+                                        font-weight: signer.picked ? 600 : 400;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if root.create-wizard-step == 2: ScrollView {
+                    vertical-stretch: 1;
+                    Text {
+                        text: root.create-wizard-summary;
+                        wrap: word-wrap;
+                        font-size: 13px;
+                    }
+                }
+
+                if root.create-wizard-error != "": Text {
+                    text: root.create-wizard-error;
+                    color: #c00;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                }
+
+                HorizontalBox {
+                    spacing: 8px;
+                    if root.create-wizard-step > 0: Button {
+                        text: "Назад";
+                        enabled: !root.busy;
+                        clicked => { root.create-wizard-back(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Отмена";
+                        clicked => { root.create-wizard-cancel(); }
+                    }
+                    if root.create-wizard-step < 2: Button {
+                        text: "Далее";
+                        enabled: !root.busy;
+                        clicked => { root.create-wizard-next(); }
+                    }
+                    if root.create-wizard-step == 2: Button {
+                        text: root.busy ? "Создание…" : "Создать";
+                        enabled: !root.busy;
+                        clicked => { root.create-wizard-create(); }
+                    }
+                }
+            }
+        }
+    }
+}

@@ -43,6 +43,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/groups", get(list_groups).post(create_group))
         .route("/api/groups/{id}", get(get_group))
         .route("/api/groups/{id}/device", put(set_group_device))
+        .route("/api/groups/{id}/accept", post(accept_group_participation))
         .route("/api/groups/{id}/members", post(add_member))
         .route("/api/groups/{id}/dkg", post(start_dkg))
         .route("/api/groups/{id}/reshare", post(start_reshare))
@@ -544,7 +545,21 @@ async fn set_group_device(
         return Ok(StatusCode::NO_CONTENT);
     }
     let joining = status == "resharing" && current.is_none();
-    if status != "forming" && !joining {
+    if status == "forming" {
+        let accepted: bool = sqlx::query_scalar(
+            "SELECT accepted_at IS NOT NULL FROM group_members WHERE group_id = $1 AND user_id = $2",
+        )
+        .bind(group_id)
+        .bind(user.id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(ApiError::db)?;
+        if !accepted {
+            return Err(bad(
+                "сначала подтвердите участие в группе (кнопка в клиенте)",
+            ));
+        }
+    } else if status != "forming" && !joining {
         return Err(bad("ключ участника уже зафиксирован"));
     }
     sqlx::query("UPDATE group_members SET box_public = $3 WHERE group_id = $1 AND user_id = $2")
@@ -559,6 +574,20 @@ async fn set_group_device(
         crate::reshare::note_device(&state, group_id).await?;
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn accept_group_participation(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    Path(group_id): Path<Uuid>,
+    Json(body): Json<DeviceKeyRequest>,
+) -> Result<Json<GroupDto>, ApiError> {
+    ceremony::accept_participation(&state, user.id, group_id, &body.public_key_hex).await?;
+    Ok(Json(
+        db::load_group(&state.pool, group_id, user.id)
+            .await
+            .map_err(ApiError::db)?,
+    ))
 }
 
 async fn list_groups(
@@ -616,7 +645,7 @@ async fn create_group(
     .await
     .map_err(ApiError::db)?;
     for (index, username) in members.iter().enumerate() {
-        let signer = active_signer(&mut *tx, username).await?;
+        let signer = signer_user(&mut *tx, username).await?;
         let identifier = i32::try_from(index + 1).unwrap_or(i32::MAX);
         sqlx::query(
             "INSERT INTO group_members (group_id, user_id, identifier) VALUES ($1, $2, $3)",
@@ -654,6 +683,28 @@ fn member_names(names: &[String]) -> Result<Vec<String>, ApiError> {
         members.push(name.to_string());
     }
     Ok(members)
+}
+
+async fn signer_user(
+    executor: impl sqlx::Executor<'_, Database = sqlx::Postgres>,
+    username: &str,
+) -> Result<Uuid, ApiError> {
+    let row: Option<(Uuid, String)> =
+        sqlx::query_as("SELECT id, role FROM users WHERE username = $1")
+            .bind(username)
+            .fetch_optional(executor)
+            .await
+            .map_err(ApiError::db)?;
+    let Some((id, role)) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("пользователь {username} не найден"),
+        ));
+    };
+    if role != ROLE_SIGNER {
+        return Err(bad(format!("{username} не подписант")));
+    }
+    Ok(id)
 }
 
 async fn active_signer(

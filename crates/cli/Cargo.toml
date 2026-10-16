@@ -23,7 +23,7 @@ ai-signing-client = { path = "../client" }
 ai-signing-protocol = { path = "../protocol" }
 arboard = "3"
 async-channel = "2"
-ratatui = "0.29"
+ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = "1"
 serde_json = "1"

@@ -35,4 +35,19 @@ impl Hub {
             self.publish(*user, message).await;
         }
     }
+
+    pub async fn is_online(&self, user: Uuid) -> bool {
+        self.inner
+            .lock()
+            .await
+            .get(&user)
+            .is_some_and(|senders| !senders.is_empty())
+    }
+
+    pub async fn all_online(&self, users: &[Uuid]) -> bool {
+        let guard = self.inner.lock().await;
+        users
+            .iter()
+            .all(|user| guard.get(user).is_some_and(|senders| !senders.is_empty()))
+    }
 }

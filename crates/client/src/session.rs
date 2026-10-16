@@ -68,6 +68,9 @@ pub enum Cmd {
     History {
         group_id: Uuid,
     },
+    AcceptGroupParticipation {
+        group_id: Uuid,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -784,7 +787,21 @@ impl Session {
         self.focus_events.clear();
         let outcome = match cmd {
             Cmd::Login { username, password } => {
-                self.auth("/api/login", &username, &password).await
+                tracing::info!(username = %username, "session: login");
+                match self.auth("/api/login", &username, &password).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            role = ?self.role,
+                            username = ?self.username,
+                            "session: login ok"
+                        );
+                        Ok(())
+                    }
+                    Err(err) => {
+                        tracing::warn!(?err, "session: login failed");
+                        Err(err)
+                    }
+                }
             }
             Cmd::Logout => {
                 self.vault = None;
@@ -833,6 +850,40 @@ impl Session {
                         self.focus_group = Some(group.clone());
                         self.upsert_group(group);
                         self.notice = Some("Участник добавлен".into());
+                        Ok(())
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+            Cmd::AcceptGroupParticipation { group_id } => {
+                let Some(group) = self.groups.iter().find(|g| g.id == group_id).cloned() else {
+                    self.error = Some("Группа не найдена".into());
+                    self.emit();
+                    return true;
+                };
+                if group.status != "forming" {
+                    self.error = Some("Группа уже не принимает подтверждения".into());
+                    self.emit();
+                    return true;
+                }
+                let public_key = match self.group_public(group_id) {
+                    Ok(key) => key,
+                    Err(err) => {
+                        self.error = Some(err);
+                        self.emit();
+                        return true;
+                    }
+                };
+                let updated: Result<GroupDto, CallError> = self
+                    .post(
+                        &format!("/api/groups/{group_id}/accept"),
+                        &serde_json::json!({ "public_key_hex": public_key }),
+                    )
+                    .await;
+                match updated {
+                    Ok(group) => {
+                        self.adopt_group(group);
+                        self.notice = Some("Участие в группе подтверждено".into());
                         Ok(())
                     }
                     Err(err) => Err(err),
@@ -901,6 +952,18 @@ impl Session {
                 remove,
             } => {
                 self.preserve_error = false;
+                let Some(group) = self.groups.iter().find(|g| g.id == group_id).cloned() else {
+                    self.error = Some("Группа не найдена".into());
+                    self.emit();
+                    return true;
+                };
+                if let Err(message) =
+                    crate::membership::membership_change(&group, &self.requests, &add, &remove)
+                {
+                    self.error = Some(message);
+                    self.emit();
+                    return true;
+                }
                 let group: Result<GroupDto, CallError> = self
                     .post(
                         &format!("/api/groups/{group_id}/reshare"),
@@ -955,6 +1018,7 @@ impl Session {
     }
 
     async fn auth(&mut self, path: &str, username: &str, password: &str) -> Result<(), CallError> {
+        tracing::debug!(path, username, server = %self.server_url, "session: POST auth");
         let auth: AuthResponse = self
             .send(
                 self.http
@@ -1116,6 +1180,19 @@ impl Session {
         if group.my_identifier.is_none() || self.vault.is_none() {
             return Ok(());
         }
+        if group.status == "forming" {
+            let Some(user_id) = self.user_id else {
+                return Ok(());
+            };
+            let accepted = group
+                .members
+                .iter()
+                .find(|member| member.user_id == user_id)
+                .is_some_and(|member| member.participation_accepted);
+            if !accepted {
+                return Ok(());
+            }
+        }
         let Some(user_id) = self.user_id else {
             return Ok(());
         };
@@ -1247,11 +1324,14 @@ impl Session {
             }
             ServerMsg::GroupUpdated { group } => {
                 let group = group.clone();
-                self.ensure_group_key(&group)
-                    .await
-                    .map_err(|err| err.text())?;
                 self.upsert_group(group.clone());
                 if self.vault.is_some() {
+                    if let Err(err) = self.ensure_group_key(&group).await {
+                        tracing::warn!(group_id = %group.id, ?err, "не удалось зарегистрировать ключ устройства в группе");
+                        if self.error.is_none() {
+                            self.error = Some(err.text());
+                        }
+                    }
                     produced.extend(self.with_party(&group, |party| {
                         party
                             .set_group(group.clone())
@@ -1544,6 +1624,7 @@ impl Session {
     }
 }
 
+#[derive(Debug)]
 enum CallError {
     Unauthorized,
     Message(String),

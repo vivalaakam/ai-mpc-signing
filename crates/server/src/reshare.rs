@@ -67,7 +67,22 @@ pub async fn start(
         .await
         .map_err(ApiError::db)?;
     if status != "active" {
-        return Err(bad("пересчёт долей доступен только активной группе"));
+        let message = match status.as_str() {
+            "resharing" => "дождитесь завершения текущего пересчёта долей",
+            "dkg" => "дождитесь завершения генерации ключа",
+            _ => "пересчёт долей доступен только активной группе",
+        };
+        return Err(bad(message));
+    }
+    let reshare_busy: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM reshare_sessions WHERE group_id = $1)",
+    )
+    .bind(group_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::db)?;
+    if reshare_busy {
+        return Err(bad("дождитесь завершения текущего пересчёта долей"));
     }
     let busy: bool = sqlx::query_scalar(
         "SELECT EXISTS(

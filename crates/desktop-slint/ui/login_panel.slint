@@ -1,0 +1,60 @@
+import { Button, LineEdit, VerticalBox } from "std-widgets.slint";
+
+export component LoginPanel {
+    in property <string> server-url;
+    in-out property <string> login-username;
+    in-out property <string> login-password;
+    in property <bool> busy;
+    in property <string> status-text;
+    in property <bool> status-is-error;
+
+    callback login-submit(string, string);
+
+    VerticalBox {
+        padding: 24px;
+        spacing: 12px;
+        alignment: center;
+
+        Text { text: "Подпись MPC"; font-size: 22px; }
+        Text {
+            text: "Пороговая подпись Ed25519. Доля ключа остаётся на этом устройстве.";
+            color: #666;
+            wrap: word-wrap;
+        }
+        Text { text: "Сервер: " + root.server-url; color: #666; }
+
+        VerticalBox {
+            spacing: 4px;
+            Text { text: "Имя"; font-size: 12px; color: #666; }
+            login-user := LineEdit {
+                text <=> root.login-username;
+                placeholder-text: "имя";
+                min-width: 320px;
+                accepted => { root.login-submit(login-user.text, login-pass.text); }
+            }
+        }
+        VerticalBox {
+            spacing: 4px;
+            Text { text: "Пароль"; font-size: 12px; color: #666; }
+            login-pass := LineEdit {
+                text <=> root.login-password;
+                placeholder-text: "пароль";
+                input-type: password;
+                min-width: 320px;
+                accepted => { root.login-submit(login-user.text, login-pass.text); }
+            }
+        }
+        Button {
+            text: root.busy ? "Вход…" : "Войти";
+            enabled: !root.busy;
+            clicked => { root.login-submit(login-user.text, login-pass.text); }
+        }
+        Text {
+            text: root.status-text;
+            color: root.status-is-error ? #c00 : #666;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+            visible: root.status-text != "";
+        }
+    }
+}

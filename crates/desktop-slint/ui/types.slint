@@ -1,0 +1,31 @@
+export struct GroupRow {
+    id: string,
+    label: string,
+    selected: bool,
+}
+
+export struct SignerRow {
+    username: string,
+    picked: bool,
+}
+
+export struct MemberRow {
+    username: string,
+    detail: string,
+    remove-picked: bool,
+}
+
+export struct FormingMemberRow {
+    username: string,
+    status-line: string,
+    ready: bool,
+}
+
+export struct RequestRow {
+    id: string,
+    title: string,
+    body: string,
+    can-approve: bool,
+    status-line: string,
+    action-hint: string,
+}

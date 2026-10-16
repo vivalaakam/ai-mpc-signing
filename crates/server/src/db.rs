@@ -32,6 +32,12 @@ pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {
     )
     .await?;
     apply(pool, "006", include_str!("../migrations/006_reshare.sql")).await?;
+    apply(
+        pool,
+        "007",
+        include_str!("../migrations/007_member_acceptance.sql"),
+    )
+    .await?;
     Ok(())
 }
 
@@ -82,6 +88,7 @@ struct MemberRow {
     username: String,
     identifier: i32,
     box_public: Option<String>,
+    participation_accepted: bool,
 }
 
 pub async fn load_group(
@@ -97,7 +104,8 @@ pub async fn load_group(
     .fetch_one(pool)
     .await?;
     let members = sqlx::query_as::<_, MemberRow>(
-        "SELECT gm.user_id, u.username, gm.identifier, gm.box_public
+        "SELECT gm.user_id, u.username, gm.identifier, gm.box_public,
+                (gm.accepted_at IS NOT NULL) AS participation_accepted
          FROM group_members gm
          JOIN users u ON u.id = gm.user_id
          WHERE gm.group_id = $1
@@ -139,6 +147,7 @@ pub async fn load_group(
                 username: member.username,
                 identifier: member.identifier as u16,
                 box_public_hex: member.box_public,
+                participation_accepted: member.participation_accepted,
             })
             .collect(),
     })

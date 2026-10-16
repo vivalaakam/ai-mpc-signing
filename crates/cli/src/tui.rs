@@ -454,7 +454,7 @@ impl App {
             return;
         };
         let (add, remove) = self.chosen_members();
-        match membership_change(&group, &add, &remove) {
+        match membership_change(&group, &self.state.requests, &add, &remove) {
             Ok((add, remove)) => {
                 self.send(
                     Cmd::Reshare {
@@ -1164,7 +1164,7 @@ impl App {
         } else if add.is_empty() && remove.is_empty() {
             lines.push(Line::from("Отметьте, кого убрать или добавить."));
         } else {
-            match membership_change(group, &add, &remove) {
+            match membership_change(group, &self.state.requests, &add, &remove) {
                 Ok(_) => {
                     let staying = group.members.len() - remove.len();
                     let total = staying + add.len();
@@ -1583,7 +1583,12 @@ mod tests {
         app.members.add.insert("carol".into());
         let (add, remove) = app.chosen_members();
         let plan =
-            ai_signing_client::membership_change(app.members_group().unwrap(), &add, &remove)
+            ai_signing_client::membership_change(
+                app.members_group().unwrap(),
+                &app.state.requests,
+                &add,
+                &remove,
+            )
                 .unwrap();
         assert_eq!(plan.0, vec!["carol".to_string()]);
         assert_eq!(plan.1, vec!["dave".to_string()]);
@@ -1629,6 +1634,7 @@ mod tests {
             username: name.into(),
             identifier,
             box_public_hex: Some("aa".into()),
+            participation_accepted: true,
         }
     }
 

@@ -1195,12 +1195,14 @@ mod tests {
                 username: "alice".into(),
                 identifier: 1,
                 box_public_hex: Some(alice_key.public_hex()),
+                participation_accepted: true,
             },
             MemberDto {
                 user_id: bob_id,
                 username: "bob".into(),
                 identifier: 2,
                 box_public_hex: Some(bob_key.public_hex()),
+                participation_accepted: true,
             },
         ];
         let group_for = |identifier| GroupDto {

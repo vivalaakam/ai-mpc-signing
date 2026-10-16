@@ -49,6 +49,8 @@ pub struct MemberDto {
     pub username: String,
     pub identifier: u16,
     pub box_public_hex: Option<String>,
+    /// Подписант явно подтвердил участие в группе на этапе forming.
+    pub participation_accepted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

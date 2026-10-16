@@ -6,6 +6,7 @@ members = [
     "crates/client",
     "crates/cli",
     "crates/desktop",
+    "crates/desktop-slint",
     "crates/e2e",
 ]
 
@@ -16,6 +17,7 @@ default-members = [
     "crates/client",
     "crates/cli",
     "crates/desktop",
+    "crates/desktop-slint",
 ]
 
 [workspace.package]

@@ -68,6 +68,11 @@ async fn connected(
             .await;
         return;
     };
+    let forming_group_ids: Vec<Uuid> = groups
+        .iter()
+        .filter(|group| group.status == "forming")
+        .map(|group| group.id)
+        .collect();
     let hello = ServerMsg::Hello { user_id, username };
     let snap = ServerMsg::Snapshot { groups, requests };
     if send_msg(&mut sink, &hello).await.is_err() || send_msg(&mut sink, &snap).await.is_err() {
@@ -77,6 +82,9 @@ async fn connected(
         if send_msg(&mut sink, &message).await.is_err() {
             return;
         }
+    }
+    for group_id in forming_group_ids {
+        ceremony::maybe_auto_start_dkg(&state, group_id).await;
     }
 
     loop {

@@ -51,6 +51,9 @@ pub struct Launch {
     pub config_path: PathBuf,
     pub database_path: PathBuf,
     pub certificate_path: Option<PathBuf>,
+    /// JSON-план для headless e2e (Slint-клиент).
+    pub test_script_path: Option<PathBuf>,
+    pub verbose: bool,
     pub rest: Vec<String>,
 }
 
@@ -62,6 +65,8 @@ where
     let mut config = None;
     let mut database = None;
     let mut certificate = None;
+    let mut test_script = None;
+    let mut verbose = false;
     let mut rest = Vec::new();
     let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
@@ -87,6 +92,15 @@ where
                 .next()
                 .ok_or_else(|| "у --certificate нет пути".to_string())?;
             set_once(&mut certificate, "--certificate", path.as_ref())?;
+        } else if let Some(path) = arg.strip_prefix("--test-script=") {
+            set_once(&mut test_script, "--test-script", path)?;
+        } else if arg == "--test-script" {
+            let path = args
+                .next()
+                .ok_or_else(|| "у --test-script нет пути".to_string())?;
+            set_once(&mut test_script, "--test-script", path.as_ref())?;
+        } else if arg == "--verbose" || arg == "-v" {
+            verbose = true;
         } else if arg == "--help" || arg == "-h" {
             rest.push(arg.to_string());
         } else if arg.starts_with('-') {
@@ -103,6 +117,8 @@ where
             .map(PathBuf::from)
             .unwrap_or_else(default_database_path),
         certificate_path: certificate.map(PathBuf::from),
+        test_script_path: test_script.map(PathBuf::from),
+        verbose,
         rest,
     })
 }

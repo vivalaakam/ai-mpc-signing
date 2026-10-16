@@ -907,6 +907,7 @@ mod tests {
                     username: format!("p{id}"),
                     identifier: *id,
                     box_public_hex: Some(device.public_hex()),
+                    participation_accepted: true,
                 })
                 .collect();
             let mut parties = Vec::new();
@@ -957,6 +958,7 @@ mod tests {
                     username: format!("p{id}"),
                     identifier: *id,
                     box_public_hex: Some(device.public_hex()),
+                    participation_accepted: true,
                 }];
                 let group = group_dto(self.group_id, uuid::Uuid::new_v4(), *id, 2, &members);
                 self.parties.push(Party {

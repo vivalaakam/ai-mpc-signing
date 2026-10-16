@@ -20,7 +20,7 @@ pub use config::{
     default_config_path, default_database_path, parse_args, socket_path_for, Config, Launch,
 };
 pub use control::{try_forward, Unlink};
-pub use membership::membership_change;
+pub use membership::{membership_change, signing_in_progress};
 pub use session::{auto, execute, start, watch, Cmd, Reply, SettleWait, UiState};
 pub use store::{ShareEpoch, Store};
 pub use vault::Vault;

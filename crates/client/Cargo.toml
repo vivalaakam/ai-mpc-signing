@@ -23,3 +23,4 @@ rand = "0.8"
 toml = "0.8"
 uuid = { version = "1", features = ["serde"] }
 zeroize = "1"
+tracing.workspace = true

@@ -1,0 +1,56 @@
+import { Button, VerticalBox, ScrollView, HorizontalBox } from "std-widgets.slint";
+import { RequestRow } from "types.slint";
+
+export component InboxPanel {
+    in property <bool> is-admin;
+    in property <bool> busy;
+    in property <[RequestRow]> requests;
+
+    callback approve-request(string);
+    callback reject-request(string);
+
+    ScrollView {
+        VerticalBox {
+            padding: 12px;
+            spacing: 8px;
+            for req[i] in root.requests: Rectangle {
+                border-width: 1px;
+                border-color: #ccc;
+                border-radius: 4px;
+                VerticalBox {
+                    padding: 8px;
+                    spacing: 4px;
+                    Text { text: req.title; font-weight: 600; }
+                    Text { text: req.body; wrap: word-wrap; }
+                    Text { text: req.status-line; color: #666; font-size: 12px; }
+                    if req.can-approve: HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: "Подписать";
+                            enabled: !root.busy;
+                            clicked => { root.approve-request(req.id); }
+                        }
+                        Button {
+                            text: "Отклонить";
+                            enabled: !root.busy;
+                            clicked => { root.reject-request(req.id); }
+                        }
+                    }
+                    if !req.can-approve && req.action-hint != "": Text {
+                        text: req.action-hint;
+                        color: #854d0e;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                    }
+                }
+            }
+            if root.requests.length == 0: Text {
+                text: root.is-admin
+                    ? "Подписанных сообщений пока нет."
+                    : "Сообщений пока нет. Когда администратор создаст перевод, он появится здесь и на вкладке «Группа».";
+                color: #888;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

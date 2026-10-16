@@ -813,7 +813,7 @@ impl AppView {
             .map(|member| member.username.clone())
             .collect();
         let (add, remove) = self.chosen_membership(group);
-        let check = membership_change(group, &add, &remove);
+        let check = membership_change(group, &self.state.requests, &add, &remove);
         let staying = members
             .iter()
             .filter(|member| !remove.iter().any(|name| name == &member.username))
@@ -951,7 +951,7 @@ impl AppView {
                                     return;
                                 };
                                 let (add, remove) = this.chosen_membership(&group);
-                                match membership_change(&group, &add, &remove) {
+                                match membership_change(&group, &this.state.requests, &add, &remove) {
                                     Ok((add, remove)) => this.send(
                                         Cmd::Reshare {
                                             group_id,

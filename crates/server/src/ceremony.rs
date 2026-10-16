@@ -83,16 +83,68 @@ async fn publish_request(
     Ok(())
 }
 
-pub async fn start_dkg(state: &AppState, user: Uuid, group_id: Uuid) -> Result<(), ApiError> {
-    let group = db::load_group(&state.pool, group_id, user)
+pub async fn accept_participation(
+    state: &AppState,
+    user_id: Uuid,
+    group_id: Uuid,
+    public_key_hex: &str,
+) -> Result<(), ApiError> {
+    let bytes = hex::decode(public_key_hex.trim())
+        .map_err(|_| bad("публичный ключ не является hex"))?;
+    if bytes.len() != 32 {
+        return Err(bad("публичный ключ участника должен быть 32 байта"));
+    }
+    let public_hex = hex::encode(bytes);
+    let row: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT g.status, gm.accepted_at
+         FROM group_members gm
+         JOIN groups g ON g.id = gm.group_id
+         WHERE gm.group_id = $1 AND gm.user_id = $2",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(ApiError::db)?;
+    let Some((status, accepted_at)) = row else {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "вы не участник этой группы",
+        ));
+    };
+    if status != "forming" {
+        return Err(bad("группа уже не принимает подтверждения"));
+    }
+    if accepted_at.is_some() {
+        return Err(bad("участие уже подтверждено"));
+    }
+    let username: String = sqlx::query_scalar("SELECT username FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_one(&state.pool)
         .await
         .map_err(ApiError::db)?;
-    if !group.i_created {
-        return Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "запустить DKG может создатель группы",
-        ));
-    }
+    let mut tx = state.pool.begin().await.map_err(ApiError::db)?;
+    sqlx::query(
+        "UPDATE group_members
+         SET accepted_at = now(), box_public = $3
+         WHERE group_id = $1 AND user_id = $2",
+    )
+    .bind(group_id)
+    .bind(user_id)
+    .bind(&public_hex)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::db)?;
+    db::insert_group_event(&mut *tx, group_id, "member_confirmed", &username, &username)
+        .await
+        .map_err(ApiError::db)?;
+    tx.commit().await.map_err(ApiError::db)?;
+    publish_group(state, group_id).await?;
+    maybe_auto_start_dkg(state, group_id).await;
+    Ok(())
+}
+
+fn validate_dkg_readiness(group: &ai_signing_protocol::GroupDto) -> Result<(), ApiError> {
     if group.status != "forming" {
         return Err(bad("группа уже не набирает участников"));
     }
@@ -103,16 +155,26 @@ pub async fn start_dkg(state: &AppState, user: Uuid, group_id: Uuid) -> Result<(
             group.members.len()
         )));
     }
+    if let Some(member) = group.members.iter().find(|member| !member.participation_accepted) {
+        return Err(bad(format!(
+            "{} ещё не подтвердил участие в группе",
+            member.username
+        )));
+    }
     if let Some(member) = group
         .members
         .iter()
         .find(|member| member.box_public_hex.is_none())
     {
         return Err(bad(format!(
-            "у {} ещё нет ключа для этой группы: пусть этот пользователь откроет приложение",
+            "у {} нет ключа устройства для этой группы",
             member.username
         )));
     }
+    Ok(())
+}
+
+async fn begin_dkg(state: &AppState, group_id: Uuid) -> Result<(), ApiError> {
     let updated =
         sqlx::query("UPDATE groups SET status = 'dkg' WHERE id = $1 AND status = 'forming'")
             .bind(group_id)
@@ -120,8 +182,9 @@ pub async fn start_dkg(state: &AppState, user: Uuid, group_id: Uuid) -> Result<(
             .await
             .map_err(ApiError::db)?;
     if updated.rows_affected() == 0 {
-        return Err(bad("не удалось начать DKG"));
+        return Ok(());
     }
+    tracing::info!(%group_id, "DKG запущен");
     publish_group(state, group_id).await?;
     let members = db::member_ids(&state.pool, group_id)
         .await
@@ -131,6 +194,50 @@ pub async fn start_dkg(state: &AppState, user: Uuid, group_id: Uuid) -> Result<(
         .publish_all(&members, &ServerMsg::DkgStarted { group_id })
         .await;
     Ok(())
+}
+
+pub async fn maybe_auto_start_dkg(state: &AppState, group_id: Uuid) {
+    let Ok(Some(creator)) =
+        sqlx::query_scalar("SELECT created_by FROM groups WHERE id = $1")
+            .bind(group_id)
+            .fetch_optional(&state.pool)
+            .await
+    else {
+        return;
+    };
+    let Ok(group) = db::load_group(&state.pool, group_id, creator).await else {
+        return;
+    };
+    if validate_dkg_readiness(&group).is_err() {
+        return;
+    }
+    let Ok(members) = db::member_ids(&state.pool, group_id).await else {
+        return;
+    };
+    if !state.hub.all_online(&members).await {
+        return;
+    }
+    let _ = begin_dkg(state, group_id).await;
+}
+
+pub async fn start_dkg(state: &AppState, user: Uuid, group_id: Uuid) -> Result<(), ApiError> {
+    let group = db::load_group(&state.pool, group_id, user)
+        .await
+        .map_err(ApiError::db)?;
+    if !group.i_created {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "запустить DKG может создатель группы",
+        ));
+    }
+    validate_dkg_readiness(&group)?;
+    let members = db::member_ids(&state.pool, group_id)
+        .await
+        .map_err(ApiError::db)?;
+    if !state.hub.all_online(&members).await {
+        return Err(bad("не все участники в сети — откройте клиент у каждого подписанта"));
+    }
+    begin_dkg(state, group_id).await
 }
 
 pub async fn dkg_round1(

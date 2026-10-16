@@ -1,0 +1,196 @@
+import { Button, LineEdit, VerticalBox, ScrollView, HorizontalBox } from "std-widgets.slint";
+import { MemberRow, FormingMemberRow } from "types.slint";
+
+export component GroupPanel {
+    in property <bool> is-admin;
+    in property <bool> busy;
+    in property <string> group-detail-title;
+    in property <string> group-detail-body;
+    in property <string> group-ceremony-banner;
+    in property <bool> show-forming-panel;
+    in property <string> forming-panel-hint;
+    in property <[FormingMemberRow]> forming-members;
+    in property <bool> show-accept-participation;
+    in property <bool> start-dkg-enabled;
+    in property <bool> show-membership-editor;
+    in property <[MemberRow]> member-remove-pick;
+    in property <[MemberRow]> member-add-pick;
+    in property <string> group-signer-hint;
+    in property <bool> show-group-sign-panel;
+    in property <string> group-sign-title;
+    in property <string> group-sign-body;
+    in property <string> group-sign-status;
+    in property <string> group-sign-hint;
+    in property <string> group-sign-request-id;
+    in property <bool> group-sign-can-approve;
+    in property <bool> show-solana-actions;
+    in-out property <string> solana-recipient;
+    in-out property <string> solana-lamports;
+
+    callback start-dkg-clicked();
+    callback reshare-clicked();
+    callback request-solana-clicked();
+    callback approve-request(string);
+    callback reject-request(string);
+    callback toggle-remove-member(string);
+    callback toggle-add-member(string);
+    callback accept-participation-clicked();
+
+    ScrollView {
+        VerticalBox {
+            padding: 16px;
+            spacing: 12px;
+            Text { text: root.group-detail-title; font-size: 18px; font-weight: 600; }
+            Text { text: root.group-detail-body; wrap: word-wrap; color: #444; }
+
+            if root.group-ceremony-banner != "": Text {
+                text: root.group-ceremony-banner;
+                color: #854d0e;
+                wrap: word-wrap;
+                font-size: 13px;
+            }
+
+            if root.show-forming-panel: VerticalBox {
+                spacing: 10px;
+                Text {
+                    text: root.forming-panel-hint;
+                    wrap: word-wrap;
+                    color: #444;
+                    font-size: 13px;
+                }
+                Text { text: "Участники"; font-weight: 600; font-size: 12px; }
+                for fm[i] in root.forming-members: Rectangle {
+                    border-radius: 6px;
+                    background: fm.ready ? #ecfdf5 : #fafafa;
+                    border-width: 1px;
+                    border-color: fm.ready ? #6ee7b7 : #e4e4e7;
+                    HorizontalBox {
+                        padding: 8px;
+                        spacing: 8px;
+                        Text {
+                            text: fm.ready ? "✓ " + fm.username : "○ " + fm.username;
+                            color: fm.ready ? #047857 : #52525b;
+                            font-weight: fm.ready ? 600 : 400;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                        Text {
+                            text: fm.status-line;
+                            color: #71717a;
+                            font-size: 11px;
+                        }
+                    }
+                }
+                if root.show-accept-participation: Button {
+                    text: "Подтвердить участие";
+                    enabled: !root.busy;
+                    clicked => { root.accept-participation-clicked(); }
+                }
+                if root.is-admin && !root.start-dkg-enabled: Text {
+                    text: "Ожидаем подтверждения и подключения всех подписантов — DKG стартует сам.";
+                    color: #888;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                if root.is-admin && root.start-dkg-enabled: VerticalBox {
+                    spacing: 6px;
+                    Text {
+                        text: "Все подтвердили участие. DKG запустится, когда все подписанты будут в сети, или нажмите вручную.";
+                        color: #666;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    Button {
+                        text: "Запустить генерацию ключа";
+                        enabled: !root.busy;
+                        clicked => { root.start-dkg-clicked(); }
+                    }
+                }
+            }
+
+            if root.show-membership-editor: VerticalBox {
+                spacing: 8px;
+                Text { text: "Состав группы"; font-weight: 600; }
+                Text { text: "Убрать"; font-size: 12px; color: #666; }
+                for member[i] in root.member-remove-pick: Button {
+                    text: member.remove-picked ? "✓ " + member.detail : member.detail;
+                    enabled: !root.busy;
+                    clicked => { root.toggle-remove-member(member.username); }
+                }
+                Text { text: "Добавить"; font-size: 12px; color: #666; }
+                for join[i] in root.member-add-pick: Button {
+                    text: join.remove-picked ? "✓ " + join.detail : join.detail;
+                    enabled: !root.busy;
+                    clicked => { root.toggle-add-member(join.username); }
+                }
+                Button {
+                    text: "Пересчитать доли";
+                    enabled: !root.busy;
+                    clicked => { root.reshare-clicked(); }
+                }
+            }
+
+            if root.group-signer-hint != "": Text {
+                text: root.group-signer-hint;
+                color: #444;
+                wrap: word-wrap;
+                font-size: 13px;
+            }
+
+            if root.show-group-sign-panel: Rectangle {
+                border-width: 1px;
+                border-color: #2563eb;
+                border-radius: 8px;
+                background: #eff6ff;
+                VerticalBox {
+                    padding: 12px;
+                    spacing: 8px;
+                    Text { text: "Запрос на подпись"; font-weight: 700; }
+                    Text { text: root.group-sign-title; font-weight: 600; }
+                    Text { text: root.group-sign-body; wrap: word-wrap; }
+                    Text {
+                        text: root.group-sign-status;
+                        color: #666;
+                        font-size: 12px;
+                    }
+                    if root.group-sign-can-approve: HorizontalBox {
+                        spacing: 8px;
+                        Button {
+                            text: "Подписать";
+                            enabled: !root.busy;
+                            clicked => { root.approve-request(root.group-sign-request-id); }
+                        }
+                        Button {
+                            text: "Отклонить";
+                            enabled: !root.busy;
+                            clicked => { root.reject-request(root.group-sign-request-id); }
+                        }
+                    }
+                    if !root.group-sign-can-approve && root.group-sign-hint != "": Text {
+                        text: root.group-sign-hint;
+                        color: #854d0e;
+                        wrap: word-wrap;
+                        font-size: 12px;
+                    }
+                }
+            }
+
+            if root.show-solana-actions: VerticalBox {
+                spacing: 8px;
+                Text { text: "Перевод Solana"; font-weight: 600; }
+                LineEdit {
+                    text <=> root.solana-recipient;
+                    placeholder-text: "адрес Solana (base58)";
+                }
+                LineEdit {
+                    text <=> root.solana-lamports;
+                    placeholder-text: "сумма в lamports";
+                }
+                Button {
+                    text: "Создать перевод Solana";
+                    enabled: !root.busy;
+                    clicked => { root.request-solana-clicked(); }
+                }
+            }
+        }
+    }
+}

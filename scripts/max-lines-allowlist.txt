@@ -1,0 +1,15 @@
+# Legacy files >300 lines — shrink over time; do not add new paths.
+crates/cli/src/main.rs
+crates/cli/src/tui.rs
+crates/client/src/session.rs
+crates/client/src/store.rs
+crates/desktop/src/main.rs
+crates/desktop-slint/src/controller.rs
+crates/desktop-slint/src/ui_sync.rs
+crates/protocol/src/engine.rs
+crates/protocol/src/lib.rs
+crates/protocol/src/reshare.rs
+crates/server/src/ceremony.rs
+crates/server/src/db.rs
+crates/server/src/reshare.rs
+crates/server/src/routes.rs

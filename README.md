@@ -46,9 +46,19 @@ cargo run --bin ai-signing-admin -- issue-cert alice /tmp/alice.cert.json
 
 ## Окно
 
+GPUI (текущий десктоп по умолчанию):
+
 ```bash
 cargo run --bin ai-signing-gui -- --database ./data/alice.sqlite
 ```
+
+Slint (отдельный клиент, задел под мультиплатформу и мобильные сборки):
+
+```bash
+cargo run -p ai-signing-desktop-slint --bin ai-signing-gui-slint -- --database ./data/alice.sqlite
+```
+
+Разметка Slint лежит в `crates/desktop-slint/ui/` (`app.slint` — только API окна и связка, экраны — отдельные `.slint`). В репозитории действует лимит **300 строк** на файл исходников (тесты не считаются); проверка: `./scripts/check-max-lines.sh`.
 
 Войдите под пользователем, которого создал администратор сервера. Пароль нужен при каждом открытии: он проверяется сервером и открывает локальные ключи. Пока окно открыто, оно держит связь с сервером и участвует в протоколе. Администратор создаёт группу и отмечает в ней активных подписантов. Когда группа активна, создатель создаёт перевод SOL. На той же карточке он отмечает, кого убрать и кого добавить, и запускает пересчёт долей. Подписант видит получателя и сумму и подтверждает или отклоняет запрос.
 
@@ -126,6 +136,15 @@ cargo test -p ai-signing-e2e --test reshare_e2e
 ```bash
 cargo test -p ai-signing-e2e --test solana_cli_e2e
 ```
+
+Slint: окно администратора и одно окно подписанта, остальные участники — автоподписанты. Сценарий: группа 3-из-4, DKG, три перевода в эмулятор Solana, reshare (удаление и добавление участника).
+
+```bash
+cargo test -p ai-signing-e2e --test gui_slint_e2e
+cargo test -p ai-signing-e2e --test slint_group_forming_e2e
+```
+
+Headless JSON-сценарии для этого теста: бинарник `ai-signing-gui-slint-e2e`, код — `crates/e2e/src/slint/` (в основном Slint-клиенте только feature `test-harness` для bootstrap контроллера).
 
 Проверить подпись можно в отдельном окне, без входа в учётную запись:
 

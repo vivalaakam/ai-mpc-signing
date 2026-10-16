@@ -26,14 +26,20 @@ name = "ai-signing-auto-e2e"
 path = "../cli/src/auto.rs"
 test = false
 
+[[bin]]
+name = "ai-signing-gui-slint-e2e"
+path = "src/gui_slint_main.rs"
+test = false
+
 [dependencies]
 ai-signing-client = { path = "../client" }
+ai-signing-desktop-slint = { path = "../desktop-slint", features = ["test-harness"] }
 ai-signing-protocol = { path = "../protocol" }
 arboard = "3"
 async-channel = "2"
-ratatui = "0.29"
+ratatui = "0.30"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["serde"] }
 tracing.workspace = true
